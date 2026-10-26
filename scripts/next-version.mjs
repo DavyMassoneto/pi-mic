@@ -1,14 +1,15 @@
 // Próxima versão pelos commits convencionais desde a última tag v*.
 // Imprime a versão ou nada (sem feat/fix/perf/breaking = sem release).
 // Sem tag nenhuma, a primeira release usa a versão do package.json.
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 
-const sh = (cmd) => execSync(cmd, { encoding: "utf8" }).trim();
+const git = (...args) =>
+  execFileSync("git", args, { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
 
 let last;
 try {
-  last = sh('git describe --tags --abbrev=0 --match "v*"');
+  last = git("describe", "--tags", "--abbrev=0", "--match", "v*");
 } catch {
   last = undefined;
 }
@@ -21,7 +22,7 @@ const PATCH = 1;
 const MINOR = 2;
 const MAJOR = 3;
 let bump = 0;
-for (const msg of sh(`git log ${last}..HEAD --format=%B%x00`).split("\0")) {
+for (const msg of git("log", `${last}..HEAD`, "--format=%B%x00").split("\0")) {
   const m = /^(\w+)(\([^)]*\))?(!)?: /.exec(msg.trim());
   if (!m) continue;
   if (m[3] || /^BREAKING[ -]CHANGE: /m.test(msg)) bump = Math.max(bump, MAJOR);
