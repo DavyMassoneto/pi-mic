@@ -64,7 +64,7 @@ function powershell(script: string, env: NodeJS.ProcessEnv = {}): ChildProcess {
 }
 
 function tempWav(): string {
-  // MCI não aceita caminho curto (~1) entre aspas; usa o caminho longo.
+  // MCI falha no save com caminho curto (ADMINI~1); usa o caminho longo.
   const dir = realpathSync.native(tmpdir());
   return join(dir, `pi-mic-${process.pid}-${Date.now()}.wav`);
 }
@@ -93,9 +93,8 @@ export async function listInputDevices(): Promise<string[]> {
 
 function startWindows(deviceIndex: number | undefined): Promise<Recording> {
   const out = tempWav();
-  const quoted = out.includes(" ") ? `"${out}"` : out;
   const child = powershell(WIN_RECORD, {
-    PI_MIC_OUT: quoted,
+    PI_MIC_OUT: `"${out}"`,
     PI_MIC_DEVICE: deviceIndex === undefined ? "" : String(deviceIndex),
   });
   let buf = "";

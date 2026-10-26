@@ -34,7 +34,12 @@ function detectTarget() {
   return run?.port ? `http://${run.hostname || "127.0.0.1"}:${run.port}` : undefined;
 }
 
-const target = new URL(arg("--target") || process.env.PI_MIC_WEB_TARGET || detectTarget() || "");
+const targetUrl = arg("--target") || process.env.PI_MIC_WEB_TARGET || detectTarget();
+if (!targetUrl) {
+  console.error("pi-mic-web: pi-web address unknown; pass --target http://host:port");
+  process.exit(1);
+}
+const target = new URL(targetUrl);
 const [listenHost, listenPort] = (
   arg("--listen") ||
   process.env.PI_MIC_WEB_LISTEN ||
@@ -178,10 +183,6 @@ server.on("upgrade", (req, socket, head) => {
   socket.on("error", () => up.destroy());
 });
 
-if (!target.host) {
-  console.error("pi-mic-web: pi-web address unknown; pass --target http://host:port");
-  process.exit(1);
-}
 server.listen(Number(listenPort), listenHost, () => {
   console.log(`pi-mic-web: http://${listenHost}:${listenPort} → ${target.origin}`);
 });
