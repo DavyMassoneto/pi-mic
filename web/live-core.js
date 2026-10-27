@@ -55,6 +55,131 @@ export function toPcm16k(input, rate) {
   return out;
 }
 
+/** Quadros de voz (20 ms cada) para um trecho contar como fala: 200 ms de vogais. */
+const MIN_VOICED = 10;
+
+/**
+ * @typedef {{ frames: Int16Array[], voiced: number, quiet: number, interimAt: number, interim: string, closed?: boolean }} Seg
+ * @returns {Seg}
+ */
+const newSeg = () => ({ frames: [], voiced: 0, quiet: 0, interimAt: 0, interim: "" });
+
+/**
+ * Periodicidade do quadro: pico da autocorrelação normalizada entre 80 e 400 Hz (0..1).
+ * @param {Int16Array} f
+ */
+export function periodicity(f) {
+  let mean = 0;
+  for (let i = 0; i < f.length; i++) mean += f[i];
+  mean /= f.length;
+  const x = new Float32Array(f.length);
+  let e0 = 0;
+  for (let i = 0; i < f.length; i++) {
+    x[i] = f[i] - mean;
+    e0 += x[i] * x[i];
+  }
+  if (e0 === 0) return 0;
+  let best = 0;
+  for (let lag = SAMPLE_RATE / 400; lag <= SAMPLE_RATE / 80; lag++) {
+    let c = 0;
+    let e1 = 0;
+    let e2 = 0;
+    for (let i = 0; i + lag < x.length; i++) {
+      c += x[i] * x[i + lag];
+      e1 += x[i] * x[i];
+      e2 += x[i + lag] * x[i + lag];
+    }
+    const r = c / Math.sqrt(e1 * e2 || 1);
+    if (r > best) best = r;
+  }
+  return best;
+}
+
+/**
+ * Junta `rest` + `chunk`, chama `each` para cada quadro de 20 ms e devolve a sobra.
+ * @param {Int16Array} rest
+ * @param {Int16Array} chunk
+ * @param {(f: Int16Array) => void} each
+ */
+function frames(rest, chunk, each) {
+  const all = new Int16Array(rest.length + chunk.length);
+  all.set(rest);
+  all.set(chunk, rest.length);
+  let off = 0;
+  for (; off + FRAME <= all.length; off += FRAME) each(all.slice(off, off + FRAME));
+  return all.slice(off);
+}
+
+/** Detector de voz por quadro: alto (acima do ruído de fundo) E periódico. */
+export class VoiceDetector {
+  constructor() {
+    this.floor = 150;
+  }
+
+  /** @param {Int16Array} f */
+  frame(f) {
+    let sum = 0;
+    for (let i = 0; i < f.length; i++) sum += f[i] * f[i];
+    const rms = Math.sqrt(sum / f.length);
+    // Ruído de fundo pelo mínimo: desce rápido, sobe devagar. Não depende de começar em silêncio.
+    this.floor =
+      rms < this.floor ? this.floor * 0.7 + rms * 0.3 : this.floor + (rms - this.floor) * 0.002;
+    // Vogais têm tom; clique de tecla e batida são altos mas sem tom.
+    const voiced = rms > Math.max(300, this.floor * 3) && periodicity(f) > 0.45;
+    return { level: Math.min(1, rms / 6000), voiced };
+  }
+}
+
+/**
+ * Portão de ruído para o streaming: repassa o áudio com 300 ms de atraso e zera o que não está
+ * perto de voz (300 ms antes até 700 ms depois), para teclado e batidas não virarem palavras.
+ */
+export class NoiseGate {
+  /**
+   * @param {(pcm: Int16Array) => void} out
+   * @param {(level: number) => void} [onLevel]
+   */
+  constructor(out, onLevel) {
+    this.out = out;
+    this.onLevel = onLevel;
+    this.vad = new VoiceDetector();
+    this.rest = new Int16Array(0);
+    /** @type {Int16Array[]} */
+    this.queue = [];
+    this.index = 0; // índice do próximo quadro que entra
+    this.lastVoiced = -1_000_000;
+    this.delay = 15;
+    this.hold = 35;
+  }
+
+  /** @param {Int16Array} chunk */
+  push(chunk) {
+    this.rest = frames(this.rest, chunk, (f) => {
+      const { level, voiced } = this.vad.frame(f);
+      this.onLevel?.(level);
+      if (voiced) this.lastVoiced = this.index;
+      this.queue.push(f);
+      this.index++;
+    });
+    if (this.queue.length > this.delay) this.emit(this.queue.length - this.delay);
+  }
+
+  /** @param {number} n */
+  emit(n) {
+    const first = this.index - this.queue.length;
+    const batch = this.queue.splice(0, n);
+    const out = new Int16Array(batch.length * FRAME);
+    for (let k = 0; k < batch.length; k++)
+      if (this.lastVoiced >= first + k - this.hold) out.set(batch[k], k * FRAME);
+    this.out(out);
+  }
+
+  /** Solta o que está no atraso (ao parar). */
+  flush() {
+    if (this.queue.length) this.emit(this.queue.length);
+  }
+}
+
 /** @param {string[]} parts */
 const join = (parts) =>
   parts
@@ -82,12 +207,9 @@ export class LiveTranscriber {
     this.maxFrames = Math.round((opts.maxSegmentMs ?? 12000) / 20);
     this.interimFrames = Math.round((opts.interimEveryMs ?? 800) / 20);
     this.rest = new Int16Array(0);
-    this.preroll = /** @type {Int16Array[]} */ ([]);
-    this.floor = 0;
-    this.calibrated = 0;
-    this.loud = 0;
-    /** @type {{ frames: Int16Array[], speech: number, quiet: number, interimAt: number, interim: string, closed?: boolean } | null} */
-    this.seg = null;
+    this.vad = new VoiceDetector();
+    /** @type {Seg} */
+    this.seg = newSeg();
     /** @type {{ interim: string, final?: string, done: Promise<void> }[]} */
     this.closed = [];
     this.inFlight = false;
@@ -97,54 +219,36 @@ export class LiveTranscriber {
   /** @param {Int16Array} chunk */
   push(chunk) {
     if (this.cancelled) return;
-    const all = new Int16Array(this.rest.length + chunk.length);
-    all.set(this.rest);
-    all.set(chunk, this.rest.length);
-    let off = 0;
-    for (; off + FRAME <= all.length; off += FRAME)
-      this.frame(all.subarray(off, off + FRAME).slice());
-    this.rest = all.slice(off);
+    this.rest = frames(this.rest, chunk, (f) => this.frame(f));
   }
 
-  /** @param {Int16Array} f */
+  /**
+   * Nada é descartado antes da fala: o trecho acumula todo o áudio desde o último corte, e a
+   * detecção de voz só decide onde cortar e se o trecho tem fala que valha enviar.
+   * @param {Int16Array} f
+   */
   frame(f) {
-    let sum = 0;
-    for (let i = 0; i < f.length; i++) sum += f[i] * f[i];
-    const rms = Math.sqrt(sum / f.length);
-    this.opts.onLevel?.(Math.min(1, rms / 6000));
-
-    // Ruído de fundo: média dos primeiros 300 ms, depois só dos quadros sem fala.
-    if (this.calibrated < 15) {
-      this.floor = (this.floor * this.calibrated + rms) / (this.calibrated + 1);
-      this.calibrated++;
-    }
-    const threshold = Math.max(350, this.floor * 2.5);
-    const speaking = rms > threshold;
-    if (!speaking && !this.seg) this.floor = this.floor * 0.95 + rms * 0.05;
-
-    if (!this.seg) {
-      this.preroll.push(f);
-      if (this.preroll.length > 15) this.preroll.shift();
-      this.loud = speaking ? this.loud + 1 : 0;
-      if (this.loud >= 3) {
-        this.seg = { frames: this.preroll, speech: 3, quiet: 0, interimAt: 0, interim: "" };
-        this.preroll = [];
-      }
-      return;
-    }
+    const { level, voiced } = this.vad.frame(f);
+    this.opts.onLevel?.(level);
 
     const seg = this.seg;
     seg.frames.push(f);
-    if (speaking) {
-      seg.speech++;
+    if (voiced) {
+      seg.voiced++;
       seg.quiet = 0;
     } else seg.quiet++;
+
+    if (seg.voiced < MIN_VOICED) {
+      // Sem fala ainda: guarda só o último 1 s (cobre o início da primeira sílaba).
+      if (seg.frames.length > 50) seg.frames.splice(0, seg.frames.length - 50);
+      if (seg.quiet >= this.silenceFrames) seg.voiced = 0;
+      return;
+    }
     if (seg.quiet >= this.silenceFrames || seg.frames.length >= this.maxFrames) this.close();
-    else if (seg.speech >= 8 && seg.frames.length - seg.interimAt >= this.interimFrames)
-      this.interim(seg);
+    else if (seg.frames.length - seg.interimAt >= this.interimFrames) this.interim(seg);
   }
 
-  /** @param {NonNullable<LiveTranscriber["seg"]>} seg */
+  /** @param {Seg} seg */
   interim(seg) {
     if (this.inFlight) return;
     this.inFlight = true;
@@ -163,11 +267,9 @@ export class LiveTranscriber {
 
   close() {
     const seg = this.seg;
-    this.seg = null;
-    this.loud = 0;
-    if (!seg) return;
+    this.seg = newSeg();
     seg.closed = true;
-    if (seg.speech < 8) return; // < 160 ms de fala: ruído
+    if (seg.voiced < MIN_VOICED) return; // sem voz: ruído, teclado, respiração
     /** @type {{ interim: string, final?: string, done: Promise<void> }} */
     const entry = { interim: seg.interim, done: Promise.resolve() };
     entry.done = this.call(seg.frames).then((r) => {
@@ -196,7 +298,7 @@ export class LiveTranscriber {
     for (; i < this.closed.length && this.closed[i].final !== undefined; i++)
       committed.push(this.closed[i].final ?? "");
     const pending = this.closed.slice(i).map((c) => c.final ?? c.interim);
-    if (this.seg) pending.push(this.seg.interim);
+    pending.push(this.seg.interim);
     return { committed: join(committed), pending: join(pending) };
   }
 
@@ -215,6 +317,6 @@ export class LiveTranscriber {
 
   cancel() {
     this.cancelled = true;
-    this.seg = null;
+    this.seg = newSeg();
   }
 }

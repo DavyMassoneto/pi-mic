@@ -7,6 +7,9 @@ import net from "node:net";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { WebSocket, WebSocketServer } from "ws";
+import { openRealtime } from "./deepgram.js";
+import { NoiseGate } from "./live-core.js";
 
 const PREFIX = "/__pi-mic";
 const MAX_AUDIO = 25 * 1024 * 1024;
@@ -59,6 +62,54 @@ function resolveEndpoint() {
   if (!apiKey) throw new Error(`no API key for provider "${provider}"`);
   if (!baseUrl) throw new Error(`no baseUrl for provider "${provider}"`);
   return { apiKey, baseUrl, model: config.model || "deepgram/nova-3", language: config.language };
+}
+
+function micConfig() {
+  return readJson(join(agentDir, "pi-mic.json")) ?? {};
+}
+
+/**
+ * Tempo real: o navegador manda PCM 16 kHz int16 em binário e "stop" em texto; o servidor passa
+ * pelo portão de ruído, repassa ao Deepgram e devolve {type:"update"|"done"|"error"}.
+ * @param {WebSocket} client
+ */
+function handleStream(client) {
+  const config = micConfig();
+  const send = (obj) => client.readyState === WebSocket.OPEN && client.send(JSON.stringify(obj));
+  const apiKey = process.env.DEEPGRAM_API_KEY || config.realtime?.apiKey;
+  if (!config.realtime || !apiKey) {
+    send({ type: "error", message: "realtime is not configured; run /mic setup in pi" });
+    return client.close();
+  }
+  const rt = openRealtime({
+    apiKey,
+    url: config.realtime.url,
+    model: config.realtime.model,
+    language: config.language,
+    onUpdate: (committed, pending) => send({ type: "update", committed, pending }),
+    onError: (err) => send({ type: "error", message: err.message }),
+  });
+  const gate = new NoiseGate((pcm) => rt.send(pcm));
+  let finished = false;
+  client.on("message", async (data, isBinary) => {
+    if (isBinary) {
+      const b = Buffer.isBuffer(data) ? data : Buffer.concat(/** @type {Buffer[]} */ (data));
+      const pcm = new Int16Array(b.buffer.slice(b.byteOffset, b.byteOffset + (b.length & ~1)));
+      return gate.push(pcm);
+    }
+    if (String(data) !== "stop" || finished) return;
+    finished = true;
+    gate.flush();
+    try {
+      send({ type: "done", text: await rt.finish() });
+    } catch (err) {
+      send({ type: "error", message: err.message });
+    }
+    client.close();
+  });
+  client.on("close", () => {
+    if (!finished) rt.cancel();
+  });
 }
 
 const EXT = { "audio/webm": "webm", "audio/ogg": "ogg", "audio/mp4": "m4a", "audio/wav": "wav" };
@@ -169,10 +220,16 @@ const server = http.createServer((req, res) => {
   }
   if (req.url === `${PREFIX}/transcribe` && req.method === "POST")
     return handleTranscribe(req, res);
+  if (req.url === `${PREFIX}/config`)
+    return sendJson(res, 200, { realtime: !!micConfig().realtime });
   proxy(req, res);
 });
 
+const streams = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
+
 server.on("upgrade", (req, socket, head) => {
+  if (req.url === `${PREFIX}/stream`)
+    return streams.handleUpgrade(req, socket, head, (ws) => handleStream(ws));
   const up = net.connect(Number(target.port), target.hostname, () => {
     const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`];
     for (const [k, v] of Object.entries(upstreamHeaders(req.headers))) {
