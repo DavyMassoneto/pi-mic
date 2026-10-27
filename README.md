@@ -36,9 +36,17 @@ grava do microfone padrão do sistema.
 | Configurar provider/modelo/idioma | `/mic setup` |
 | Testar o endpoint | `/mic check` |
 
-Enquanto grava, o rodapé mostra `🔴 REC`. Ao parar, a transcrição é acrescentada ao texto do
-editor. Gravação: Windows usa a API `winmm` nativa (nada a instalar); macOS/Linux usam
-`rec` (SoX) ou `arecord`.
+A transcrição aparece no editor enquanto você fala: o pi-mic detecta as pausas e transcreve
+cada trecho assim que ele termina, com uma prévia parcial enquanto o trecho ainda cresce.
+Funciona com qualquer endpoint `/audio/transcriptions`, sem exigir streaming do provider.
+Enquanto grava, o editor fica travado (só `Alt+M` para parar e `Esc` para cancelar e voltar ao
+texto de antes) e o rodapé mostra `🔴` com o nível do microfone.
+
+Captura: Windows usa a API `waveIn` nativa (nada a instalar); macOS/Linux usam `rec` (SoX) ou
+`arecord`. Para testes, `PI_MIC_FAKE_INPUT=<arquivo.wav>` (16 kHz mono) substitui o microfone.
+
+Defina `language` (por exemplo `"pt-BR"`): trechos curtos atrapalham a detecção automática de
+idioma.
 
 ## pi-web
 
@@ -51,8 +59,9 @@ npx -p pi-mic pi-mic-web                      # descobre o pi-web em ~/.pi/agent
 npx -p pi-mic pi-mic-web --target http://100.91.99.83:3041 --listen 127.0.0.1:3042
 ```
 
-Abra `http://127.0.0.1:3042`. O botão 🎙 aparece no campo de mensagem; clique ou use
-`Alt+M` para gravar e de novo para parar.
+Abra `http://127.0.0.1:3042`. O botão de microfone fica na linha do campo de mensagem, logo
+antes do Enviar; clique ou use `Alt+M` para gravar e de novo para parar, `Esc` cancela. Como no
+CLI, o texto entra ao vivo e o campo (e o Enviar) ficam travados até a transcrição terminar.
 
 O navegador só libera o microfone em contexto seguro: `localhost`/`127.0.0.1` ou HTTPS. Para
 usar de outro aparelho, publique o `pi-mic-web` com HTTPS dentro da sua rede privada (por

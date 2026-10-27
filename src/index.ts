@@ -1,16 +1,26 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
+import { matchesKey } from "@earendil-works/pi-tui";
+import { LiveTranscriber } from "../web/live-core.js";
 import { loadConfig, type MicConfig, saveConfig } from "./config.ts";
-import { listInputDevices, type Recording, startRecording } from "./recorder.ts";
+import { type Capture, listInputDevices, startCapture } from "./recorder.ts";
 import { appendText, silentWav, transcribe } from "./transcribe.ts";
 
 const STATUS = "pi-mic";
 const SHORTCUT = "alt+m";
 
+interface Live {
+  live: LiveTranscriber;
+  capture: Capture;
+  /** Texto do editor antes de gravar; a transcrição é acrescentada a ele. */
+  base: string;
+  unlock: () => void;
+}
+
 type State =
   | { kind: "idle" }
   | { kind: "starting" }
-  | { kind: "recording"; rec: Recording }
-  | { kind: "transcribing" };
+  | { kind: "recording"; rec: Live }
+  | { kind: "transcribing"; rec: Live };
 
 async function resolveEndpoint(ctx: ExtensionContext, config: MicConfig) {
   if (!config.provider) throw new Error("no provider set; run /mic setup");
@@ -31,23 +41,101 @@ async function deviceIndex(config: MicConfig): Promise<number | undefined> {
   return i;
 }
 
-function insertText(ctx: ExtensionContext, text: string): void {
-  ctx.ui.setEditorText(appendText(ctx.ui.getEditorText(), text));
-}
+const METER = " ▁▂▃▄▅▆▇█";
 
 export default function (pi: ExtensionAPI) {
   let state: State = { kind: "idle" };
 
-  const setState = (ctx: ExtensionContext, next: State) => {
-    state = next;
+  const status = (ctx: ExtensionContext, level = 0) => {
     const label = {
       idle: undefined,
       starting: "🎙 starting…",
-      recording: `🔴 REC — ${SHORTCUT} to stop`,
-      transcribing: "🎙 transcribing…",
-    }[next.kind];
+      recording: `🔴 ${METER[Math.round(level * 8)]} listening — ${SHORTCUT} stops, esc cancels`,
+      transcribing: "🎙 finishing transcription…",
+    }[state.kind];
     ctx.ui.setStatus(STATUS, label);
   };
+
+  const setState = (ctx: ExtensionContext, next: State) => {
+    state = next;
+    status(ctx);
+  };
+
+  function finish(ctx: ExtensionContext, rec: Live, text: string | null) {
+    rec.unlock();
+    ctx.ui.setEditorText(text === null ? rec.base : appendText(rec.base, text));
+    setState(ctx, { kind: "idle" });
+  }
+
+  async function start(ctx: ExtensionContext): Promise<void> {
+    setState(ctx, { kind: "starting" });
+    try {
+      const config = loadConfig();
+      const endpoint = await resolveEndpoint(ctx, config);
+      const base = ctx.ui.getEditorText();
+      let lastMeter = 0;
+      const live = new LiveTranscriber({
+        interimEveryMs: 600,
+        transcribe: (wav) =>
+          transcribe({
+            ...endpoint,
+            model: config.model,
+            language: config.language,
+            audio: wav,
+            mimeType: "audio/wav",
+            fileName: "speech.wav",
+          }),
+        onUpdate: (committed, pending) => {
+          if (state.kind !== "recording" && state.kind !== "transcribing") return;
+          ctx.ui.setEditorText(appendText(base, [committed, pending].filter(Boolean).join(" ")));
+        },
+        onLevel: (level) => {
+          const now = Date.now();
+          if (state.kind === "recording" && now - lastMeter > 100) {
+            lastMeter = now;
+            status(ctx, level);
+          }
+        },
+        onError: (err) => ctx.ui.notify(`pi-mic: ${err.message}`, "error"),
+      });
+      const capture = await startCapture(await deviceIndex(config), (pcm) => live.push(pcm));
+      // Editor travado: só Alt+M (parar) e Esc (cancelar) passam.
+      const unlock = ctx.ui.onTerminalInput((data) => {
+        if (matchesKey(data, SHORTCUT)) void toggle(ctx);
+        else if (matchesKey(data, "escape")) cancel(ctx);
+        return { consume: true };
+      });
+      setState(ctx, { kind: "recording", rec: { live, capture, base, unlock } });
+    } catch (err) {
+      setState(ctx, { kind: "idle" });
+      ctx.ui.notify(`pi-mic: ${(err as Error).message}`, "error");
+    }
+  }
+
+  async function stop(ctx: ExtensionContext, rec: Live): Promise<void> {
+    setState(ctx, { kind: "transcribing", rec });
+    try {
+      await rec.capture.stop();
+      const text = await rec.live.stop();
+      if (!text)
+        ctx.ui.notify(
+          "pi-mic: no speech detected (wrong input device? try /mic device)",
+          "warning",
+        );
+      finish(ctx, rec, text);
+    } catch (err) {
+      ctx.ui.notify(`pi-mic: ${(err as Error).message}`, "error");
+      finish(ctx, rec, null);
+    }
+  }
+
+  function cancel(ctx: ExtensionContext): void {
+    if (state.kind !== "recording" && state.kind !== "transcribing") return;
+    const { rec } = state;
+    rec.live.cancel();
+    rec.capture.cancel();
+    finish(ctx, rec, null);
+  }
 
   async function toggle(ctx: ExtensionContext): Promise<void> {
     if (ctx.mode !== "tui" || !ctx.hasUI) {
@@ -57,47 +145,8 @@ export default function (pi: ExtensionAPI) {
       );
       return;
     }
-    if (state.kind === "starting" || state.kind === "transcribing") return;
-
-    if (state.kind === "idle") {
-      setState(ctx, { kind: "starting" });
-      try {
-        const rec = await startRecording(await deviceIndex(loadConfig()));
-        setState(ctx, { kind: "recording", rec });
-      } catch (err) {
-        setState(ctx, { kind: "idle" });
-        ctx.ui.notify(`pi-mic: ${(err as Error).message}`, "error");
-      }
-      return;
-    }
-
-    const { rec } = state;
-    setState(ctx, { kind: "transcribing" });
-    try {
-      const config = loadConfig();
-      const audio = await rec.stop();
-      const endpoint = await resolveEndpoint(ctx, config);
-      const result = await transcribe({
-        ...endpoint,
-        model: config.model,
-        language: config.language,
-        audio,
-        mimeType: "audio/wav",
-        fileName: "speech.wav",
-      });
-      if (result.noSpeech) {
-        ctx.ui.notify(
-          "pi-mic: no speech detected (wrong input device? try /mic device)",
-          "warning",
-        );
-      } else {
-        insertText(ctx, result.text);
-      }
-    } catch (err) {
-      ctx.ui.notify(`pi-mic: ${(err as Error).message}`, "error");
-    } finally {
-      setState(ctx, { kind: "idle" });
-    }
+    if (state.kind === "idle") return start(ctx);
+    if (state.kind === "recording") return stop(ctx, state.rec);
   }
 
   async function pickDevice(ctx: ExtensionContext): Promise<void> {
@@ -171,7 +220,11 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", () => {
-    if (state.kind === "recording") state.rec.cancel();
+    if (state.kind === "recording" || state.kind === "transcribing") {
+      state.rec.live.cancel();
+      state.rec.capture.cancel();
+      state.rec.unlock();
+    }
     state = { kind: "idle" };
   });
 }
