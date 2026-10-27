@@ -66,8 +66,21 @@
     }
     const r = ta.getBoundingClientRect();
     btn.style.display = "flex";
-    btn.style.left = `${r.right - 36}px`;
+    btn.style.left = `${rightEdge(ta, r) - 36}px`;
     btn.style.top = `${r.top + Math.max(0, (r.height - 30) / 2)}px`;
+  }
+
+  /** Borda onde o botão encosta: à esquerda dos botões do campo (ex.: Enviar) na mesma linha. */
+  function rightEdge(ta, r) {
+    let box = ta.parentElement;
+    for (let i = 0; i < 3 && box && !box.querySelector("button"); i++) box = box.parentElement;
+    if (!box) return r.right;
+    const lefts = [...box.querySelectorAll("button")]
+      .filter((b) => b !== btn && b.offsetParent !== null)
+      .map((b) => b.getBoundingClientRect())
+      .filter((b) => b.top < r.bottom && b.bottom > r.top && b.left > r.left + r.width / 2)
+      .map((b) => b.left);
+    return Math.min(r.right, ...lefts);
   }
 
   function flash(msg) {
