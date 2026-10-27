@@ -35,7 +35,6 @@ jobs:
           git tag "$NEXT"
           git push origin "$NEXT"
           gh release create "$NEXT" --generate-notes --title "$NEXT"
-      # Fecha o ciclo do git-flow: main volta para dev e a branch de release é apagada.
       - env:
           NEXT: ${{ steps.version.outputs.next }}
         run: |

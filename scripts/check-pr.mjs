@@ -1,5 +1,3 @@
-// Valida uma PR pelo git-flow e pelo Conventional Commits.
-// Uso: node scripts/check-pr.mjs <título> <branch de origem> <branch de destino>
 import { CONVENTIONAL } from "./conventional.mjs";
 
 const [title = "", head = "", base = ""] = process.argv.slice(2);
@@ -18,5 +16,5 @@ if (!rule)
 else if (!rule[1].includes(base))
   errors.push(`"${head}" must target ${rule[1].join(" or ")}, not "${base}"`);
 for (const e of errors) console.error(e);
-console.log(errors.length ? "PR inválida" : `PR ok: ${head} → ${base} "${title}"`);
+console.log(errors.length ? "invalid PR" : `PR ok: ${head} → ${base} "${title}"`);
 process.exit(errors.length ? 1 : 0);
