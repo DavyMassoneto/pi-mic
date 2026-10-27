@@ -1,6 +1,12 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { encodeWav, LiveTranscriber, NoiseGate, SAMPLE_RATE, toPcm16k } from "../web/live-core.js";
+import {
+  encodeWav,
+  floatToInt16,
+  LiveTranscriber,
+  NoiseGate,
+  SAMPLE_RATE,
+} from "../web/live-core.js";
 
 /** Tom de 220 Hz (fala) ou ruído baixo (silêncio), em ms. */
 function audio(parts: [kind: "voz" | "pausa", ms: number][]): Int16Array {
@@ -156,12 +162,30 @@ test("NoiseGate zera cliques sem tom e deixa a voz passar com atraso", () => {
   assert.ok(peak(all.subarray(16000)) > 7000, "voz preservada");
 });
 
-test("toPcm16k reamostra 48 kHz e encodeWav gera WAV válido", () => {
-  const f = new Float32Array(48000).fill(0.5);
-  const pcm = toPcm16k(f, 48000);
-  assert.equal(pcm.length, 16000);
+test("floatToInt16 não reamostra e encodeWav grava a taxa nativa", () => {
+  const pcm = floatToInt16(new Float32Array(48000).fill(0.5));
+  assert.equal(pcm.length, 48000);
   assert.equal(pcm[0], 16383);
-  const wav = encodeWav(pcm);
+  const wav = encodeWav(pcm, 48000);
   assert.equal(new TextDecoder().decode(wav.subarray(0, 4)), "RIFF");
-  assert.equal(seconds(wav), 1);
+  assert.equal(new DataView(wav.buffer).getUint32(24, true), 48000);
+});
+
+test("a 48 kHz detecta voz e envia o trecho na taxa nativa", async () => {
+  const rate = 48000;
+  const pcm = new Int16Array(rate * 2);
+  for (let i = 0; i < rate; i++)
+    pcm[i] = Math.round(8000 * Math.sin((2 * Math.PI * 220 * i) / rate));
+  let header = 0;
+  const live = new LiveTranscriber({
+    sampleRate: rate,
+    transcribe: async (wav) => {
+      header = new DataView(wav.buffer).getUint32(24, true);
+      return { text: "ok" };
+    },
+    onUpdate: () => {},
+  });
+  for (let i = 0; i < pcm.length; i += 4800) live.push(pcm.subarray(i, i + 4800));
+  assert.equal(await live.stop(), "ok");
+  assert.equal(header, rate);
 });

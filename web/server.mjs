@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // pi-mic-web: proxy na frente do pi-web que injeta o botão de microfone e transcreve o áudio
 // pelo mesmo provider do /mic (chave lida de auth.json/models.json, nunca enviada ao navegador).
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from "node:fs";
 import http from "node:http";
 import net from "node:net";
 import { homedir } from "node:os";
@@ -9,7 +9,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { WebSocket, WebSocketServer } from "ws";
 import { openRealtime } from "./deepgram.js";
-import { NoiseGate } from "./live-core.js";
+import { encodeWav, NoiseGate } from "./live-core.js";
 
 const PREFIX = "/__pi-mic";
 const MAX_AUDIO = 25 * 1024 * 1024;
@@ -68,37 +68,63 @@ function micConfig() {
   return readJson(join(agentDir, "pi-mic.json")) ?? {};
 }
 
+/** Com "debug": true no pi-mic.json, guarda o áudio recebido e os eventos de cada sessão. */
+function saveDebug(rate, raw, events) {
+  const dir = join(agentDir, "pi-mic-debug");
+  mkdirSync(dir, { recursive: true });
+  const name = new Date().toISOString().replace(/[:.]/g, "-");
+  const pcm = new Int16Array(raw.reduce((n, p) => n + p.length, 0));
+  let o = 0;
+  for (const p of raw) {
+    pcm.set(p, o);
+    o += p.length;
+  }
+  writeFileSync(join(dir, `${name}.wav`), encodeWav(pcm, rate));
+  writeFileSync(join(dir, `${name}.json`), JSON.stringify({ rate, events }, null, 2));
+}
+
 /**
  * Tempo real: o navegador manda PCM 16 kHz int16 em binário e "stop" em texto; o servidor passa
  * pelo portão de ruído, repassa ao Deepgram e devolve {type:"update"|"done"|"error"}.
  * @param {WebSocket} client
  */
-function handleStream(client) {
+function handleStream(client, req) {
   const config = micConfig();
-  const send = (obj) => client.readyState === WebSocket.OPEN && client.send(JSON.stringify(obj));
+  const t0 = Date.now();
+  const events = [];
+  const send = (obj) => {
+    if (config.debug) events.push({ ms: Date.now() - t0, ...obj });
+    if (client.readyState === WebSocket.OPEN) client.send(JSON.stringify(obj));
+  };
   const apiKey = process.env.DEEPGRAM_API_KEY || config.realtime?.apiKey;
   if (!config.realtime || !apiKey) {
     send({ type: "error", message: "realtime is not configured; run /mic setup in pi" });
     return client.close();
   }
+  const rate = Number(new URL(req.url, "http://x").searchParams.get("rate")) || 16000;
   const rt = openRealtime({
     apiKey,
+    sampleRate: rate,
     url: config.realtime.url,
     model: config.realtime.model,
     language: config.language,
+    keyterms: config.keyterms,
     onUpdate: (committed, pending) => send({ type: "update", committed, pending }),
     onError: (err) => send({ type: "error", message: err.message }),
   });
-  const gate = new NoiseGate((pcm) => rt.send(pcm));
+  const gate = new NoiseGate((pcm) => rt.send(pcm), undefined, rate);
+  const raw = [];
   let finished = false;
   client.on("message", async (data, isBinary) => {
     if (isBinary) {
       const b = Buffer.isBuffer(data) ? data : Buffer.concat(/** @type {Buffer[]} */ (data));
       const pcm = new Int16Array(b.buffer.slice(b.byteOffset, b.byteOffset + (b.length & ~1)));
+      if (config.debug) raw.push(pcm);
       return gate.push(pcm);
     }
     if (String(data) !== "stop" || finished) return;
     finished = true;
+    if (config.debug) events.push({ ms: Date.now() - t0, type: "stop" });
     gate.flush();
     try {
       send({ type: "done", text: await rt.finish() });
@@ -106,6 +132,7 @@ function handleStream(client) {
       send({ type: "error", message: err.message });
     }
     client.close();
+    if (config.debug) saveDebug(rate, raw, events);
   });
   client.on("close", () => {
     if (!finished) rt.cancel();
@@ -228,8 +255,8 @@ const server = http.createServer((req, res) => {
 const streams = new WebSocketServer({ noServer: true, maxPayload: 1024 * 1024 });
 
 server.on("upgrade", (req, socket, head) => {
-  if (req.url === `${PREFIX}/stream`)
-    return streams.handleUpgrade(req, socket, head, (ws) => handleStream(ws));
+  if (req.url.split("?")[0] === `${PREFIX}/stream`)
+    return streams.handleUpgrade(req, socket, head, (ws) => handleStream(ws, req));
   const up = net.connect(Number(target.port), target.hostname, () => {
     const lines = [`${req.method} ${req.url} HTTP/${req.httpVersion}`];
     for (const [k, v] of Object.entries(upstreamHeaders(req.headers))) {

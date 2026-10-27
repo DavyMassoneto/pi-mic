@@ -1,10 +1,12 @@
 // Núcleo da transcrição ao vivo, o mesmo no navegador (pi-web) e no Node (CLI).
-// Recebe PCM 16 kHz mono int16, separa a fala em trechos pelas pausas e manda cada trecho ao
-// endpoint de transcrição em lote: enquanto o trecho cresce, uma transcrição parcial por vez;
-// na pausa, a final. Funciona com qualquer endpoint /audio/transcriptions.
+// Recebe PCM mono int16 na taxa nativa do microfone (sem reamostrar: o áudio enviado ao
+// reconhecimento é o original). A detecção de voz analisa uma cópia reduzida só internamente.
 
+/** Taxa padrão quando quem chama não informa a sua. */
 export const SAMPLE_RATE = 16000;
-const FRAME = 320; // 20 ms
+
+/** Amostras de um quadro de 20 ms. @param {number} rate */
+const frameLen = (rate) => Math.round(rate / 50);
 
 /**
  * WAV PCM 16 bits mono.
@@ -35,21 +37,14 @@ export function encodeWav(pcm, rate = SAMPLE_RATE) {
 }
 
 /**
- * Float32 [-1, 1] numa taxa qualquer → Int16 a 16 kHz (média por janela; suficiente para voz).
+ * Float32 [-1, 1] → Int16, na mesma taxa (sem reamostrar).
  * @param {Float32Array} input
- * @param {number} rate
  * @returns {Int16Array}
  */
-export function toPcm16k(input, rate) {
-  const ratio = rate / SAMPLE_RATE;
-  const n = Math.floor(input.length / ratio);
-  const out = new Int16Array(n);
-  for (let i = 0; i < n; i++) {
-    const a = Math.floor(i * ratio);
-    const b = Math.max(a + 1, Math.floor((i + 1) * ratio));
-    let sum = 0;
-    for (let j = a; j < b; j++) sum += input[j];
-    const s = Math.max(-1, Math.min(1, sum / (b - a)));
+export function floatToInt16(input) {
+  const out = new Int16Array(input.length);
+  for (let i = 0; i < input.length; i++) {
+    const s = Math.max(-1, Math.min(1, input[i]));
     out[i] = s < 0 ? s * 0x8000 : s * 0x7fff;
   }
   return out;
@@ -66,53 +61,61 @@ const newSeg = () => ({ frames: [], voiced: 0, quiet: 0, interimAt: 0, interim: 
 
 /**
  * Periodicidade do quadro: pico da autocorrelação normalizada entre 80 e 400 Hz (0..1).
+ * Só para detectar voz; analisa uma amostra a cada `rate/16000` (o tom da voz fica bem abaixo).
  * @param {Int16Array} f
+ * @param {number} [rate]
  */
-export function periodicity(f) {
+export function periodicity(f, rate = SAMPLE_RATE) {
+  const step = Math.max(1, Math.round(rate / 16000));
+  const r = rate / step;
+  const n = Math.floor(f.length / step);
+  const x = new Float32Array(n);
   let mean = 0;
-  for (let i = 0; i < f.length; i++) mean += f[i];
-  mean /= f.length;
-  const x = new Float32Array(f.length);
+  for (let i = 0; i < n; i++) mean += f[i * step];
+  mean /= n || 1;
   let e0 = 0;
-  for (let i = 0; i < f.length; i++) {
-    x[i] = f[i] - mean;
+  for (let i = 0; i < n; i++) {
+    x[i] = f[i * step] - mean;
     e0 += x[i] * x[i];
   }
   if (e0 === 0) return 0;
   let best = 0;
-  for (let lag = SAMPLE_RATE / 400; lag <= SAMPLE_RATE / 80; lag++) {
+  for (let lag = Math.floor(r / 400); lag <= Math.ceil(r / 80); lag++) {
     let c = 0;
     let e1 = 0;
     let e2 = 0;
-    for (let i = 0; i + lag < x.length; i++) {
+    for (let i = 0; i + lag < n; i++) {
       c += x[i] * x[i + lag];
       e1 += x[i] * x[i];
       e2 += x[i + lag] * x[i + lag];
     }
-    const r = c / Math.sqrt(e1 * e2 || 1);
-    if (r > best) best = r;
+    const v = c / Math.sqrt(e1 * e2 || 1);
+    if (v > best) best = v;
   }
   return best;
 }
 
 /**
- * Junta `rest` + `chunk`, chama `each` para cada quadro de 20 ms e devolve a sobra.
+ * Junta `rest` + `chunk`, chama `each` para cada quadro de `len` amostras e devolve a sobra.
  * @param {Int16Array} rest
  * @param {Int16Array} chunk
+ * @param {number} len
  * @param {(f: Int16Array) => void} each
  */
-function frames(rest, chunk, each) {
+function frames(rest, chunk, len, each) {
   const all = new Int16Array(rest.length + chunk.length);
   all.set(rest);
   all.set(chunk, rest.length);
   let off = 0;
-  for (; off + FRAME <= all.length; off += FRAME) each(all.slice(off, off + FRAME));
+  for (; off + len <= all.length; off += len) each(all.slice(off, off + len));
   return all.slice(off);
 }
 
 /** Detector de voz por quadro: alto (acima do ruído de fundo) E periódico. */
 export class VoiceDetector {
-  constructor() {
+  /** @param {number} [rate] */
+  constructor(rate = SAMPLE_RATE) {
+    this.rate = rate;
     this.floor = 150;
   }
 
@@ -125,24 +128,27 @@ export class VoiceDetector {
     this.floor =
       rms < this.floor ? this.floor * 0.7 + rms * 0.3 : this.floor + (rms - this.floor) * 0.002;
     // Vogais têm tom; clique de tecla e batida são altos mas sem tom.
-    const voiced = rms > Math.max(300, this.floor * 3) && periodicity(f) > 0.45;
+    const voiced = rms > Math.max(300, this.floor * 3) && periodicity(f, this.rate) > 0.45;
     return { level: Math.min(1, rms / 6000), voiced };
   }
 }
 
 /**
- * Portão de ruído para o streaming: repassa o áudio com 300 ms de atraso e zera o que não está
- * perto de voz (300 ms antes até 700 ms depois), para teclado e batidas não virarem palavras.
+ * Portão de ruído para o streaming: repassa o áudio original com 300 ms de atraso e zera o que
+ * não está perto de voz (300 ms antes até 700 ms depois), para teclado e batidas não virarem
+ * palavras. O que passa não é alterado.
  */
 export class NoiseGate {
   /**
    * @param {(pcm: Int16Array) => void} out
    * @param {(level: number) => void} [onLevel]
+   * @param {number} [rate]
    */
-  constructor(out, onLevel) {
+  constructor(out, onLevel, rate = SAMPLE_RATE) {
     this.out = out;
     this.onLevel = onLevel;
-    this.vad = new VoiceDetector();
+    this.len = frameLen(rate);
+    this.vad = new VoiceDetector(rate);
     this.rest = new Int16Array(0);
     /** @type {Int16Array[]} */
     this.queue = [];
@@ -154,7 +160,7 @@ export class NoiseGate {
 
   /** @param {Int16Array} chunk */
   push(chunk) {
-    this.rest = frames(this.rest, chunk, (f) => {
+    this.rest = frames(this.rest, chunk, this.len, (f) => {
       const { level, voiced } = this.vad.frame(f);
       this.onLevel?.(level);
       if (voiced) this.lastVoiced = this.index;
@@ -168,14 +174,21 @@ export class NoiseGate {
   emit(n) {
     const first = this.index - this.queue.length;
     const batch = this.queue.splice(0, n);
-    const out = new Int16Array(batch.length * FRAME);
+    const out = new Int16Array(batch.length * this.len);
     for (let k = 0; k < batch.length; k++)
-      if (this.lastVoiced >= first + k - this.hold) out.set(batch[k], k * FRAME);
+      if (this.lastVoiced >= first + k - this.hold) out.set(batch[k], k * this.len);
     this.out(out);
   }
 
-  /** Solta o que está no atraso (ao parar). */
+  /** Solta o que está no atraso e a sobra de menos de um quadro (ao parar). */
   flush() {
+    if (this.rest.length) {
+      const tail = new Int16Array(this.len);
+      tail.set(this.rest);
+      this.rest = new Int16Array(0);
+      this.queue.push(tail);
+      this.index++;
+    }
     if (this.queue.length) this.emit(this.queue.length);
   }
 }
@@ -194,20 +207,27 @@ const join = (parts) =>
  * @property {(committed: string, pending: string) => void} onUpdate texto confirmado e o provisório
  * @property {(level: number) => void} [onLevel] nível 0..1 por quadro, para o medidor
  * @property {(err: Error) => void} [onError]
+ * @property {number} [sampleRate] taxa do PCM recebido (padrão 16000)
  * @property {number} [silenceMs] pausa que fecha um trecho
  * @property {number} [maxSegmentMs] trecho mais longo antes de fechar mesmo sem pausa
  * @property {number} [interimEveryMs] áudio novo mínimo entre transcrições parciais
  */
 
+/**
+ * Trecho a trecho, para providers sem streaming: separa a fala pelas pausas e manda cada trecho
+ * ao endpoint em lote; enquanto o trecho cresce, uma transcrição parcial por vez.
+ */
 export class LiveTranscriber {
   /** @param {LiveOptions} opts */
   constructor(opts) {
     this.opts = opts;
+    this.rate = opts.sampleRate ?? SAMPLE_RATE;
+    this.len = frameLen(this.rate);
     this.silenceFrames = Math.round((opts.silenceMs ?? 700) / 20);
     this.maxFrames = Math.round((opts.maxSegmentMs ?? 12000) / 20);
     this.interimFrames = Math.round((opts.interimEveryMs ?? 800) / 20);
     this.rest = new Int16Array(0);
-    this.vad = new VoiceDetector();
+    this.vad = new VoiceDetector(this.rate);
     /** @type {Seg} */
     this.seg = newSeg();
     /** @type {{ interim: string, final?: string, done: Promise<void> }[]} */
@@ -219,7 +239,7 @@ export class LiveTranscriber {
   /** @param {Int16Array} chunk */
   push(chunk) {
     if (this.cancelled) return;
-    this.rest = frames(this.rest, chunk, (f) => this.frame(f));
+    this.rest = frames(this.rest, chunk, this.len, (f) => this.frame(f));
   }
 
   /**
@@ -269,6 +289,10 @@ export class LiveTranscriber {
     const seg = this.seg;
     this.seg = newSeg();
     seg.closed = true;
+    if (this.rest.length) {
+      seg.frames.push(this.rest);
+      this.rest = new Int16Array(0);
+    }
     if (seg.voiced < MIN_VOICED) return; // sem voz: ruído, teclado, respiração
     /** @type {{ interim: string, final?: string, done: Promise<void> }} */
     const entry = { interim: seg.interim, done: Promise.resolve() };
@@ -281,10 +305,14 @@ export class LiveTranscriber {
 
   /** @param {Int16Array[]} frames */
   async call(frames) {
-    const pcm = new Int16Array(frames.length * FRAME);
-    for (let i = 0; i < frames.length; i++) pcm.set(frames[i], i * FRAME);
+    const pcm = new Int16Array(frames.reduce((n, f) => n + f.length, 0));
+    let o = 0;
+    for (const f of frames) {
+      pcm.set(f, o);
+      o += f.length;
+    }
     try {
-      return await this.opts.transcribe(encodeWav(pcm));
+      return await this.opts.transcribe(encodeWav(pcm, this.rate));
     } catch (err) {
       this.opts.onError?.(/** @type {Error} */ (err));
       return { text: "", noSpeech: true };
