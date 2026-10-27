@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { encodeWav, LiveTranscriber, SAMPLE_RATE, toPcm16k } from "../web/live-core.js";
+import { encodeWav, LiveTranscriber, NoiseGate, SAMPLE_RATE, toPcm16k } from "../web/live-core.js";
 
 /** Tom de 220 Hz (fala) ou ruído baixo (silêncio), em ms. */
 function audio(parts: [kind: "voz" | "pausa", ms: number][]): Int16Array {
@@ -113,6 +113,47 @@ test("cancel descarta tudo", async () => {
   live.cancel();
   feed(live, audio([["voz", 500]]));
   assert.equal(live.text().pending, "");
+});
+
+test("fala desde o primeiro quadro não se perde (sem calibrar no silêncio)", async () => {
+  let sent = 0;
+  const live = new LiveTranscriber({
+    transcribe: async (wav) => {
+      sent = seconds(wav);
+      return { text: "olá" };
+    },
+    onUpdate: () => {},
+  });
+  feed(
+    live,
+    audio([
+      ["voz", 900],
+      ["pausa", 800],
+    ]),
+  );
+  assert.equal(await live.stop(), "olá");
+  assert.ok(sent >= 0.9, `trecho enviado com ${sent} s`);
+});
+
+test("NoiseGate zera cliques sem tom e deixa a voz passar com atraso", () => {
+  const out: Int16Array[] = [];
+  const gate = new NoiseGate((pcm: Int16Array) => out.push(pcm));
+  const clicks = new Int16Array(16000);
+  for (let t = 800; t < clicks.length - 400; t += 2400)
+    for (let i = 0; i < 300; i++) clicks[t + i] = Math.round((Math.random() * 2 - 1) * 12000);
+  gate.push(clicks);
+  gate.push(audio([["voz", 1000]]));
+  gate.flush();
+  const all = new Int16Array(out.reduce((n, a) => n + a.length, 0));
+  let o = 0;
+  for (const a of out) {
+    all.set(a, o);
+    o += a.length;
+  }
+  assert.equal(all.length, 32000);
+  const peak = (a: Int16Array) => a.reduce((m, v) => Math.max(m, Math.abs(v)), 0);
+  assert.equal(peak(all.subarray(0, 16000 - 4800)), 0, "cliques longe da voz zerados");
+  assert.ok(peak(all.subarray(16000)) > 7000, "voz preservada");
 });
 
 test("toPcm16k reamostra 48 kHz e encodeWav gera WAV válido", () => {

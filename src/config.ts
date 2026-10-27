@@ -13,6 +13,22 @@ export interface MicConfig {
   language?: string;
   /** Nome do dispositivo de entrada (Windows). Vazio = padrão do sistema. */
   device?: string;
+  /** Tempo real pelo streaming do Deepgram. Sem isto, transcreve trecho a trecho via `provider`. */
+  realtime?: RealtimeConfig;
+}
+
+export interface RealtimeConfig {
+  provider: "deepgram";
+  /** Modelo do Deepgram (ex.: "nova-3"). */
+  model?: string;
+  /** Endpoint WebSocket (Deepgram self-hosted); padrão wss://api.deepgram.com/v1/listen. */
+  url?: string;
+  /** Chave do Deepgram; a variável DEEPGRAM_API_KEY tem precedência. */
+  apiKey?: string;
+}
+
+export function realtimeKey(config: MicConfig): string | undefined {
+  return process.env.DEEPGRAM_API_KEY || config.realtime?.apiKey || undefined;
 }
 
 export const DEFAULT_MODEL = "deepgram/nova-3";
