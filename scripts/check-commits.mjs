@@ -1,5 +1,3 @@
-// Falha se algum commit do intervalo (fora merges) não seguir Conventional Commits.
-// Uso: node scripts/check-commits.mjs <base> <head>
 import { execFileSync } from "node:child_process";
 import { CONVENTIONAL as RE } from "./conventional.mjs";
 

@@ -1,7 +1,7 @@
 {
   "name": "pi-mic",
   "version": "0.1.0",
-  "description": "Entrada por voz para o pi (CLI e pi-web), transcrita por um gateway OpenAI-compatível (ex.: OmniRoute → Deepgram)",
+  "description": "Voice input for pi (CLI and pi-web), transcribed through an OpenAI-compatible gateway (e.g. OmniRoute to Deepgram)",
   "type": "module",
   "keywords": [
     "pi-package",
@@ -18,16 +18,17 @@
   },
   "pi": {
     "extensions": [
-      "./src/index.ts"
+      "./src/cli/extension.ts"
     ]
   },
   "bin": {
-    "pi-mic-web": "web/server.mjs"
+    "pi-mic-web": "dist/web/server/main.js"
   },
   "files": [
     "src",
     "!src/**/*.test.ts",
-    "web",
+    "!src/testing",
+    "dist",
     "README.md"
   ],
   "peerDependencies": {
@@ -42,10 +43,13 @@
     "typescript": "^5.9"
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "prepack": "npm run build",
     "test": "node --test \"src/**/*.test.ts\"",
-    "typecheck": "tsc --noEmit",
-    "lint": "biome check src web scripts",
-    "check": "npm run lint && npm run typecheck && npm test"
+    "typecheck": "tsc -p tsconfig.json && tsc -p tsconfig.browser.json",
+    "lint": "biome check src scripts",
+    "check:comments": "node scripts/check-no-comments.mjs",
+    "check": "npm run lint && npm run check:comments && npm run typecheck && npm run build && npm test"
   },
   "dependencies": {
     "ws": "^8.22.0"

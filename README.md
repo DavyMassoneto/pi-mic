@@ -1,103 +1,125 @@
 # pi-mic
 
-Entrada por voz para o pi — no terminal (CLI) e no
-[pi-web](https://www.npmjs.com/package/@agegr/pi-web). Você fala, o áudio vai para um endpoint
-OpenAI-compatível `/v1/audio/transcriptions` (por exemplo o OmniRoute com Deepgram) e o texto
-entra no campo de mensagem, sem enviar.
+Voice input for pi, in the terminal (CLI) and in
+[pi-web](https://www.npmjs.com/package/@agegr/pi-web). You speak, the audio goes to an
+OpenAI-compatible `/v1/audio/transcriptions` endpoint (for example OmniRoute with Deepgram) and the
+text lands in the message field without being sent.
 
-## Instalação
+## Installation
 
 ```bash
 pi install npm:pi-mic
 ```
 
-Depois, no pi, uma vez:
+Then, once, inside pi:
 
 ```
-/mic setup     # escolhe o provider (chave e baseUrl vêm do models.json/auth.json) e o modelo
-/mic check     # confirma provider, chave e endpoint com um áudio de silêncio
+/mic setup     # picks the provider (key and baseUrl come from models.json/auth.json) and the model
+/mic check     # confirms provider, key and endpoint with a silent audio clip
 ```
 
-A configuração fica em `~/.pi/agent/pi-mic.json`:
+The configuration lives in `~/.pi/agent/pi-mic.json`:
 
 ```json
 { "provider": "omni-memory", "model": "deepgram/nova-3", "language": "pt", "device": "Microphone (HD Pro Webcam C920)" }
 ```
 
-`language` e `device` são opcionais: sem `language` o gateway detecta o idioma; sem `device`
-grava do microfone padrão do sistema.
+`language` and `device` are optional: without `language` the gateway detects the language; without
+`device` the system default microphone is used.
 
 ## CLI
 
-| Ação | Como |
+| Action | How |
 |---|---|
-| Começar / parar de gravar | `Alt+M` ou `/mic` |
-| Escolher o microfone (Windows) | `/mic device` |
-| Configurar provider/modelo/idioma | `/mic setup` |
-| Testar o endpoint | `/mic check` |
+| Start / stop recording | `Alt+M` or `/mic` |
+| Pick the microphone (Windows) | `/mic device` |
+| Configure provider/model/language | `/mic setup` |
+| Test the endpoint | `/mic check` |
 
-A transcrição aparece no editor enquanto você fala, de dois jeitos:
+The transcription shows up in the editor while you speak, in one of two ways:
 
-- **Tempo real (Deepgram):** com `"realtime": { "provider": "deepgram", "apiKey": "…" }` no
-  `pi-mic.json` (ou `DEEPGRAM_API_KEY`), o áudio vai pelo streaming do Deepgram e as palavras
-  chegam enquanto você fala. `/mic setup` configura.
-- **Trecho a trecho (qualquer provider):** sem `realtime`, o pi-mic separa a fala nas pausas e
-  manda cada trecho ao `/audio/transcriptions` do provider, com prévia parcial.
+- **Real time (Deepgram):** with `"realtime": { "provider": "deepgram", "apiKey": "…" }` in
+  `pi-mic.json` (or `DEEPGRAM_API_KEY`), the audio goes through Deepgram streaming and the words
+  arrive as you speak. `/mic setup` configures it.
+- **Segment by segment (any provider):** without `realtime`, pi-mic splits speech on pauses and
+  sends each segment to the provider's `/audio/transcriptions`, with a partial preview.
 
-Nos dois modos só passa áudio com voz (alto e com tom): teclado, cliques e batidas não viram
-palavras. O áudio segue na taxa nativa do microfone (48 kHz no navegador), sem reamostrar.
+In both modes only audio with voice (loud and with pitch) goes through: keyboard, clicks and
+knocks do not become words. The audio keeps the microphone's native rate (48 kHz in the browser),
+without resampling.
 
-No tempo real, ao parar, o pi-mic grava mais 500 ms (a última sílaba costuma sair junto com a
-tecla), manda `Finalize` e espera as finais do streaming, e então reenvia a gravação inteira ao
-Deepgram de áudio gravado, que vê a frase toda; esse texto substitui o do streaming.
+In real time, when you stop, pi-mic records 500 ms more (the last syllable often comes out together
+with the key press), sends `Finalize` and waits for the final streaming results, then sends the
+whole recording to Deepgram's pre-recorded endpoint, which sees the full sentence; that text
+replaces the streaming one.
 
-Opções extras no `pi-mic.json`: `"keyterms": ["pi-mic", "OmniRoute"]` (termos que o Deepgram
-deve priorizar) e `"debug": true` (o pi-mic-web guarda o áudio e os eventos de cada sessão em
+Extra options in `pi-mic.json`: `"keyterms": ["pi-mic", "OmniRoute"]` (terms Deepgram should
+prioritize) and `"debug": true` (pi-mic-web saves the audio and the events of each session in
 `~/.pi/agent/pi-mic-debug`).
-Enquanto grava, o editor fica travado (só `Alt+M` para parar e `Esc` para cancelar e voltar ao
-texto de antes) e o rodapé mostra `🔴` com o nível do microfone.
+While recording, the editor is locked (only `Alt+M` to stop and `Esc` to cancel and restore the
+previous text) and the footer shows `🔴` with the microphone level.
 
-Captura: Windows usa a API `waveIn` nativa (nada a instalar); macOS/Linux usam `rec` (SoX) ou
-`arecord`. Para testes, `PI_MIC_FAKE_INPUT=<arquivo.wav>` (16 kHz mono) substitui o microfone.
+Capture: Windows uses the native `waveIn` API (nothing to install); macOS/Linux use `rec` (SoX) or
+`arecord`. For tests, `PI_MIC_FAKE_INPUT=<file.wav>` (16 kHz mono) replaces the microphone.
 
-Defina `language` (por exemplo `"pt-BR"`): trechos curtos atrapalham a detecção automática de
-idioma.
+Set `language` (for example `"pt-BR"`): short segments hurt automatic language detection.
 
 ## pi-web
 
-O pi-web não tem ponto de extensão de interface, então o `pi-mic-web` fica na frente dele:
-um proxy que repassa tudo (HTTP, SSE e WebSocket), injeta o botão de microfone na página e
-transcreve o áudio no servidor — a chave do provider nunca vai para o navegador.
+pi-web has no UI extension point, so `pi-mic-web` sits in front of it: a proxy that forwards
+everything (HTTP, SSE and WebSocket), injects the microphone button into the page and transcribes
+the audio on the server, so the provider key never reaches the browser.
 
 ```bash
-npx -p pi-mic pi-mic-web                      # descobre o pi-web em ~/.pi/agent/pi-web-run
+npx -p pi-mic pi-mic-web                      # finds pi-web in ~/.pi/agent/pi-web-run
 npx -p pi-mic pi-mic-web --target http://100.91.99.83:3041 --listen 127.0.0.1:3042
 ```
 
-Abra `http://127.0.0.1:3042`. O botão de microfone fica na linha do campo de mensagem, logo
-antes do Enviar; clique ou use `Alt+M` para gravar e de novo para parar, `Esc` cancela. Como no
-CLI, o texto entra ao vivo e o campo (e o Enviar) ficam travados até a transcrição terminar.
+Open `http://127.0.0.1:3042`. The microphone button sits on the message field row, right before
+Send; click it or press `Alt+M` to record and again to stop, `Esc` cancels. As in the CLI, the text
+appears live and the field (and Send) stay locked until the transcription finishes.
 
-O navegador só libera o microfone em contexto seguro: `localhost`/`127.0.0.1` ou HTTPS. Para
-usar de outro aparelho, publique o `pi-mic-web` com HTTPS dentro da sua rede privada (por
-exemplo `tailscale serve --bg 3042`). Não exponha publicamente: o pi-web pode não ter senha.
+The browser only grants the microphone in a secure context: `localhost`/`127.0.0.1` or HTTPS. To
+use it from another device, publish `pi-mic-web` over HTTPS inside your private network (for
+example `tailscale serve --bg 3042`). Do not expose it publicly: pi-web may have no password.
 
-## Desenvolvimento
+## Architecture
 
-Fluxo git-flow com PRs, tudo em [Conventional Commits](https://www.conventionalcommits.org/)
-(commits e títulos de PR; o CI recusa o que não segue, e também PR com branch fora do fluxo):
+All code is TypeScript under `src/`, split by layer:
 
-1. `feature/<nome>` (ou `bugfix/<nome>`) → PR para `dev`, título como `feat: …` / `fix: …`.
-2. A cada push em `dev`, a esteira calcula a próxima versão pelos commits desde a última tag
-   (`feat` → minor, `fix`/`perf` → patch, `!`/`BREAKING CHANGE` → major; antes da 1.0 a quebra
-   sobe a minor) e abre ou atualiza sozinha a PR `release/<versão>` → `main`, título
-   `chore(release): <versão>`. Ninguém escolhe a versão.
-3. O merge em `main` publica no npm com trusted publishing, cria a tag e a release no GitHub,
-   faz o merge de `main` de volta em `dev` e apaga a branch de release.
+| Folder | Responsibility |
+|---|---|
+| `src/core` | Browser-safe audio, text and transcription logic (no Node APIs) |
+| `src/config` | Reading and writing `pi-mic.json` |
+| `src/providers` | OpenAI-compatible gateway and Deepgram clients |
+| `src/cli` | The pi extension: capture, dictation state machine, `/mic` commands |
+| `src/web/server` | The `pi-mic-web` proxy |
+| `src/web/client` | The browser script injected into pi-web |
 
-`hotfix/<nome>` sai de `main` e volta para `main`.
+pi loads the extension directly from `src/cli/extension.ts`. Only the web side is compiled
+(`npm run build` writes `dist/`); the proxy serves `dist/core` and `dist/web/client` to the browser
+under `/__pi-mic/assets/`.
+
+## Development
+
+Git-flow with PRs, everything in [Conventional Commits](https://www.conventionalcommits.org/)
+(commits and PR titles; CI rejects what does not follow them, and PRs from branches outside the
+flow):
+
+1. `feature/<name>` (or `bugfix/<name>`) → PR to `dev`, titled like `feat: …` / `fix: …`.
+2. On every push to `dev`, the pipeline computes the next version from the commits since the last
+   tag (`feat` → minor, `fix`/`perf`/`refactor` → patch, `!`/`BREAKING CHANGE` → major; before 1.0
+   a breaking change bumps the minor) and opens or updates the `release/<version>` → `main` PR on
+   its own, titled `chore(release): <version>`. Nobody picks the version.
+3. Merging into `main` publishes to npm with trusted publishing, creates the tag and the GitHub
+   release, merges `main` back into `dev` and deletes the release branch.
+
+`hotfix/<name>` branches from `main` and goes back to `main`.
 
 ```bash
 npm install
-npm run check   # biome + tsc + testes
+npm run check   # biome + no-comments + tsc + build + tests
 ```
+
+The code base has no comments by rule: names, small functions and types carry the explanation, and
+`npm run check` fails if a comment sneaks in.
