@@ -1,15 +1,72 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { matchesKey } from "@earendil-works/pi-tui";
-import { LiveTranscriber } from "../web/live-core.js";
-import { loadConfig, type MicConfig, saveConfig } from "./config.ts";
+import { openRealtime } from "../web/deepgram.js";
+import { LiveTranscriber, NoiseGate } from "../web/live-core.js";
+import { loadConfig, type MicConfig, realtimeKey, saveConfig } from "./config.ts";
 import { type Capture, listInputDevices, startCapture } from "./recorder.ts";
 import { appendText, silentWav, transcribe } from "./transcribe.ts";
 
 const STATUS = "pi-mic";
 const SHORTCUT = "alt+m";
 
+/** Transcrição em andamento: tempo real (Deepgram) ou trecho a trecho (qualquer provider). */
+interface Engine {
+  push(pcm: Int16Array): void;
+  stop(): Promise<string>;
+  cancel(): void;
+}
+
+interface EngineEvents {
+  onUpdate: (committed: string, pending: string) => void;
+  onLevel: (level: number) => void;
+  onError: (err: Error) => void;
+}
+
+async function createEngine(
+  ctx: ExtensionContext,
+  config: MicConfig,
+  ev: EngineEvents,
+): Promise<Engine> {
+  if (config.realtime) {
+    const apiKey = realtimeKey(config);
+    if (!apiKey) throw new Error("realtime needs a Deepgram key; run /mic setup");
+    const rt = openRealtime({
+      apiKey,
+      url: config.realtime.url,
+      model: config.realtime.model,
+      language: config.language,
+      onUpdate: ev.onUpdate,
+      onError: ev.onError,
+    });
+    await rt.ready();
+    const gate = new NoiseGate((pcm) => rt.send(pcm), ev.onLevel);
+    return {
+      push: (pcm) => gate.push(pcm),
+      async stop() {
+        gate.flush();
+        return rt.finish();
+      },
+      cancel: () => rt.cancel(),
+    };
+  }
+  const endpoint = await resolveEndpoint(ctx, config);
+  return new LiveTranscriber({
+    interimEveryMs: 600,
+    transcribe: (wav) =>
+      transcribe({
+        ...endpoint,
+        model: config.model,
+        language: config.language,
+        audio: wav,
+        mimeType: "audio/wav",
+        fileName: "speech.wav",
+      }),
+    ...ev,
+  });
+}
+
 interface Live {
-  live: LiveTranscriber;
+  live: Engine;
   capture: Capture;
   /** Texto do editor antes de gravar; a transcrição é acrescentada a ele. */
   base: string;
@@ -71,20 +128,9 @@ export default function (pi: ExtensionAPI) {
     setState(ctx, { kind: "starting" });
     try {
       const config = loadConfig();
-      const endpoint = await resolveEndpoint(ctx, config);
       const base = ctx.ui.getEditorText();
       let lastMeter = 0;
-      const live = new LiveTranscriber({
-        interimEveryMs: 600,
-        transcribe: (wav) =>
-          transcribe({
-            ...endpoint,
-            model: config.model,
-            language: config.language,
-            audio: wav,
-            mimeType: "audio/wav",
-            fileName: "speech.wav",
-          }),
+      const live = await createEngine(ctx, config, {
         onUpdate: (committed, pending) => {
           if (state.kind !== "recording" && state.kind !== "transcribing") return;
           ctx.ui.setEditorText(appendText(base, [committed, pending].filter(Boolean).join(" ")));
@@ -98,7 +144,13 @@ export default function (pi: ExtensionAPI) {
         },
         onError: (err) => ctx.ui.notify(`pi-mic: ${err.message}`, "error"),
       });
-      const capture = await startCapture(await deviceIndex(config), (pcm) => live.push(pcm));
+      let capture: Capture;
+      try {
+        capture = await startCapture(await deviceIndex(config), (pcm) => live.push(pcm));
+      } catch (err) {
+        live.cancel();
+        throw err;
+      }
       // Editor travado: só Alt+M (parar) e Esc (cancelar) passam.
       const unlock = ctx.ui.onTerminalInput((data) => {
         if (matchesKey(data, SHORTCUT)) void toggle(ctx);
@@ -171,18 +223,49 @@ export default function (pi: ExtensionAPI) {
     if (provider === undefined) return;
     const model = await ctx.ui.input("Transcription model", config.model);
     const language = await ctx.ui.input("Language (empty = auto)", config.language ?? "");
+    const REALTIME = "Real time (Deepgram streaming)";
+    const mode = await ctx.ui.select("Mode", [REALTIME, "Per phrase (the provider above)"]);
+    let realtime = config.realtime;
+    if (mode === REALTIME) {
+      const key = await ctx.ui.input(
+        "Deepgram API key (empty = keep current)",
+        realtime?.apiKey ? "••••" : "",
+      );
+      const apiKey = key && key !== "••••" ? key.trim() : realtime?.apiKey;
+      realtime = {
+        provider: "deepgram",
+        model: realtime?.model ?? "nova-3",
+        url: realtime?.url,
+        apiKey,
+      };
+    } else if (mode !== undefined) realtime = undefined;
     saveConfig({
       ...config,
       provider,
       model: model?.trim() || config.model,
       language: language?.trim() || undefined,
+      realtime,
     });
-    ctx.ui.notify(`pi-mic: using ${provider} / ${model?.trim() || config.model}`, "info");
+    ctx.ui.notify(
+      `pi-mic: ${realtime ? "real time via Deepgram" : `per phrase via ${provider}`}`,
+      "info",
+    );
   }
 
   async function check(ctx: ExtensionContext): Promise<void> {
     const config = loadConfig();
     try {
+      if (config.realtime) {
+        const live = await createEngine(ctx, config, {
+          onUpdate: () => {},
+          onLevel: () => {},
+          onError: () => {},
+        });
+        live.push(new Int16Array(8000));
+        await live.stop();
+        ctx.ui.notify("pi-mic: OK — real time via Deepgram streaming", "info");
+        return;
+      }
       const endpoint = await resolveEndpoint(ctx, config);
       await transcribe({
         ...endpoint,

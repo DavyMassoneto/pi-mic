@@ -36,9 +36,16 @@ grava do microfone padrão do sistema.
 | Configurar provider/modelo/idioma | `/mic setup` |
 | Testar o endpoint | `/mic check` |
 
-A transcrição aparece no editor enquanto você fala: o pi-mic detecta as pausas e transcreve
-cada trecho assim que ele termina, com uma prévia parcial enquanto o trecho ainda cresce.
-Funciona com qualquer endpoint `/audio/transcriptions`, sem exigir streaming do provider.
+A transcrição aparece no editor enquanto você fala, de dois jeitos:
+
+- **Tempo real (Deepgram):** com `"realtime": { "provider": "deepgram", "apiKey": "…" }` no
+  `pi-mic.json` (ou `DEEPGRAM_API_KEY`), o áudio vai pelo streaming do Deepgram e as palavras
+  chegam enquanto você fala. `/mic setup` configura.
+- **Trecho a trecho (qualquer provider):** sem `realtime`, o pi-mic separa a fala nas pausas e
+  manda cada trecho ao `/audio/transcriptions` do provider, com prévia parcial.
+
+Nos dois modos só passa áudio com voz (alto e com tom): teclado, cliques e batidas não viram
+palavras.
 Enquanto grava, o editor fica travado (só `Alt+M` para parar e `Esc` para cancelar e voltar ao
 texto de antes) e o rodapé mostra `🔴` com o nível do microfone.
 

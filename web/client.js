@@ -225,6 +225,44 @@ if (!window.__piMic) {
     process(inputs) { const ch = inputs[0] && inputs[0][0]; if (ch) this.port.postMessage(ch.slice(0)); return true; }
   });`;
 
+  /** Tempo real: o pi-mic-web repassa ao streaming do Deepgram (a chave fica no servidor). */
+  function realtimeEngine({ onUpdate, onError }) {
+    const ws = new WebSocket(
+      `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/__pi-mic/stream`,
+    );
+    ws.binaryType = "arraybuffer";
+    let last = "";
+    let resolveDone;
+    const done = new Promise((r) => {
+      resolveDone = r;
+    });
+    ws.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      if (m.type === "update") {
+        last = [m.committed, m.pending].filter(Boolean).join(" ");
+        onUpdate(m.committed, m.pending);
+      } else if (m.type === "done") resolveDone(m.text);
+      else if (m.type === "error") onError(new Error(m.message));
+    };
+    ws.onclose = () => resolveDone(null);
+    return new Promise((resolve, reject) => {
+      ws.onopen = () =>
+        resolve({
+          push(pcm) {
+            if (ws.readyState === WebSocket.OPEN) ws.send(pcm);
+          },
+          async stop() {
+            if (ws.readyState === WebSocket.OPEN) ws.send("stop");
+            return (await done) ?? last;
+          },
+          cancel() {
+            ws.close();
+          },
+        });
+      ws.onerror = () => reject(new Error("stream connection failed"));
+    });
+  }
+
   async function start() {
     const ta = textarea();
     if (!ta) return;
@@ -260,19 +298,24 @@ if (!window.__piMic) {
       return { value: before + pre + text + post + after, caret: (before + pre + text).length };
     };
 
-    const live = new LiveTranscriber({
-      interimEveryMs: 600,
-      transcribe: transcribeWav,
+    const events = {
       onUpdate: (committed, pending) => {
         const t = textarea();
         if (t) setValue(t, compose([committed, pending].filter(Boolean).join(" ")).value);
       },
-      onLevel: (level) => {
-        if (state === "rec")
-          btn.style.boxShadow = `0 0 0 ${2 + Math.round(level * 8)}px rgba(217,48,37,.35)`;
-      },
       onError: (err) => flash(`${T.failed}: ${err.message}`),
-    });
+    };
+    let live;
+    try {
+      const cfg = await (await fetch("/__pi-mic/config")).json();
+      live = cfg.realtime
+        ? await realtimeEngine(events)
+        : new LiveTranscriber({ interimEveryMs: 600, transcribe: transcribeWav, ...events });
+    } catch (err) {
+      for (const t of stream.getTracks()) t.stop();
+      ctx.close();
+      return flash(`${T.failed}: ${err.message}`);
+    }
 
     let buf = [];
     let len = 0;
@@ -288,7 +331,14 @@ if (!window.__piMic) {
       }
       buf = [];
       len = 0;
-      live.push(toPcm16k(all, ctx.sampleRate));
+      const pcm = toPcm16k(all, ctx.sampleRate);
+      live.push(pcm);
+      if (state === "rec") {
+        let sum = 0;
+        for (let i = 0; i < pcm.length; i++) sum += pcm[i] * pcm[i];
+        const level = Math.min(1, Math.sqrt(sum / (pcm.length || 1)) / 6000);
+        btn.style.boxShadow = `0 0 0 ${2 + Math.round(level * 8)}px rgba(217,48,37,.35)`;
+      }
     };
     source.connect(node);
 
