@@ -21,9 +21,6 @@
       "./src/cli/extension.ts"
     ]
   },
-  "bin": {
-    "pi-mic-web": "dist/web/server/main.js"
-  },
   "files": [
     "src",
     "!src/**/*.test.ts",

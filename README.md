@@ -54,7 +54,7 @@ whole recording to Deepgram's pre-recorded endpoint, which sees the full sentenc
 replaces the streaming one.
 
 Extra options in `pi-mic.json`: `"keyterms": ["pi-mic", "OmniRoute"]` (terms Deepgram should
-prioritize) and `"debug": true` (pi-mic-web saves the audio and the events of each session in
+prioritize) and `"debug": true` (the pi-web host saves the audio and the events of each session in
 `~/.pi/agent/pi-mic-debug`).
 While recording, the editor is locked (only `Alt+M` to stop and `Esc` to cancel and restore the
 previous text) and the footer shows `🔴` with the microphone level.
@@ -66,22 +66,20 @@ Set `language` (for example `"pt-BR"`): short segments hurt automatic language d
 
 ## pi-web
 
-pi-web has no UI extension point, so `pi-mic-web` sits in front of it: a proxy that forwards
-everything (HTTP, SSE and WebSocket), injects the microphone button into the page and transcribes
-the audio on the server, so the provider key never reaches the browser.
+pi-mic runs inside pi-web itself. Install it with `pi install npm:pi-mic`; when a session opens in
+pi-web, the extension attaches to pi-web's own HTTP server, injects the microphone button into the
+page and transcribes the audio on the server, so the provider key never reaches the browser. No
+extra process or port is needed. Reload the page once after pi-web starts to get the button (pi-web
+shows a notice when it is ready).
 
-```bash
-npx -p pi-mic pi-mic-web                      # finds pi-web in ~/.pi/agent/pi-web-run
-npx -p pi-mic pi-mic-web --target http://100.91.99.83:3041 --listen 127.0.0.1:3042
-```
-
-Open `http://127.0.0.1:3042`. The microphone button sits on the message field row, right before
-Send; click it or press `Alt+M` to record and again to stop, `Esc` cancels. As in the CLI, the text
-appears live and the field (and Send) stay locked until the transcription finishes.
+The microphone button sits on the message field row, right before Send; click it or press `Alt+M`
+to record and again to stop, `Esc` cancels. As in the CLI, the text appears live and the field (and
+Send) stay locked until the transcription finishes. In pi-web `/mic setup` and `/mic check` are
+available; recording happens in the browser, never on the server machine.
 
 The browser only grants the microphone in a secure context: `localhost`/`127.0.0.1` or HTTPS. To
-use it from another device, publish `pi-mic-web` over HTTPS inside your private network (for
-example `tailscale serve --bg 3042`). Do not expose it publicly: pi-web may have no password.
+use it from another device, put pi-web behind HTTPS inside your private network (for example
+`tailscale serve --bg <pi-web port>`). Do not expose pi-web publicly: it may have no password.
 
 ## Architecture
 
@@ -93,11 +91,12 @@ All code is TypeScript under `src/`, split by layer:
 | `src/config` | Reading and writing `pi-mic.json` |
 | `src/providers` | OpenAI-compatible gateway and Deepgram clients |
 | `src/cli` | The pi extension: capture, dictation state machine, `/mic` commands |
-| `src/web/server` | The `pi-mic-web` proxy |
+| `src/web/host` | Attaches the mic routes and button injection to pi-web's HTTP server |
+| `src/web/server` | Mic routes: transcription, realtime stream, config, browser assets |
 | `src/web/client` | The browser script injected into pi-web |
 
 pi loads the extension directly from `src/cli/extension.ts`. Only the web side is compiled
-(`npm run build` writes `dist/`); the proxy serves `dist/core` and `dist/web/client` to the browser
+(`npm run build` writes `dist/`); the extension serves `dist/core` and `dist/web/client` to the browser
 under `/__pi-mic/assets/`.
 
 ## Development
