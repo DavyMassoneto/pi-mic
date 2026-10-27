@@ -1,7 +1,7 @@
 name: release-pr
 
-# Git-flow automático: a cada push em dev, calcula a próxima versão pelos commits convencionais
-# desde a última tag e mantém aberta a PR release/<versão> → main. Ninguém escolhe a versão.
+# Automated git-flow: on every push to dev, compute the next version from the conventional
+# commits since the last tag and keep the release/<version> → main PR open. Nobody picks it.
 on:
   push:
     branches: [dev]
@@ -29,7 +29,7 @@ jobs:
       - id: version
         run: echo "next=$(node scripts/next-version.mjs)" >> "$GITHUB_OUTPUT"
       - if: steps.version.outputs.next == ''
-        run: echo "Nenhum feat/fix/perf/breaking desde a última tag; sem release."
+        run: echo "No feat/fix/perf/breaking change since the last tag; no release."
       - if: steps.version.outputs.next != ''
         env:
           GH_TOKEN: ${{ github.token }}
@@ -39,12 +39,12 @@ jobs:
           last=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
           range=${last:+$last..}HEAD
           notes=$(git log --no-merges --format='- %s' $range | grep -E '^- (feat|fix|perf)(\(|!|:)' || true)
-          # PRs de release de versões anteriores que ficaram para trás são substituídas.
+          # Older release PRs left behind are superseded.
           gh pr list --base main --state open --json number,headRefName \
             -q ".[] | select(.headRefName | startswith(\"release/\")) | select(.headRefName != \"$branch\") | .number" |
-            while read -r n; do gh pr close "$n" --delete-branch --comment "Substituída por $branch."; done
+            while read -r n; do gh pr close "$n" --delete-branch --comment "Superseded by $branch."; done
           git push --force origin "HEAD:refs/heads/$branch"
-          body=$(printf 'Release automática %s (versão calculada pelos commits desde %s).\n\n%s\n' "$NEXT" "${last:-o início}" "$notes")
+          body=$(printf 'Automated release %s (version computed from the commits since %s).\n\n%s\n' "$NEXT" "${last:-the first commit}" "$notes")
           if gh pr view "$branch" --json state -q .state 2>/dev/null | grep -q OPEN; then
             gh pr edit "$branch" --title "chore(release): $NEXT" --body "$body"
           else
