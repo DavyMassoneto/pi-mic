@@ -1,49 +1,90 @@
 import { type ChildProcess, spawn, spawnSync } from "node:child_process";
-import { readFileSync, realpathSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-export interface Recording {
-  /** Para a gravação e devolve o WAV (16 kHz, mono, 16 bits). */
-  stop(): Promise<Uint8Array>;
-  /** Descarta a gravação. */
+/** Captura em andamento: entrega PCM 16 kHz mono int16 em pedaços até stop()/cancel(). */
+export interface Capture {
+  stop(): Promise<void>;
   cancel(): void;
 }
 
-// winmm/MCI: presente em todo Windows, sem dependência externa.
-const MCI_TYPES = `Add-Type -Namespace PiMic -Name Winmm -MemberDefinition @'
-[DllImport("winmm.dll", CharSet=CharSet.Unicode)] public static extern int mciSendString(string c, System.Text.StringBuilder r, int l, System.IntPtr cb);
-[DllImport("winmm.dll", CharSet=CharSet.Unicode)] public static extern bool mciGetErrorString(int e, System.Text.StringBuilder b, int l);
+// waveIn (winmm): presente em todo Windows, sem dependência externa. O PCM sai cru no stdout;
+// "READY"/"ERR" vão no stderr. Uma linha no stdin encerra.
+const WAVEIN_CS = `
+using System; using System.Runtime.InteropServices; using System.Threading;
+public static class PiMicCapture {
+  [StructLayout(LayoutKind.Sequential)] struct WAVEFORMATEX { public ushort wFormatTag, nChannels; public uint nSamplesPerSec, nAvgBytesPerSec; public ushort nBlockAlign, wBitsPerSample, cbSize; }
+  [StructLayout(LayoutKind.Sequential)] struct WAVEHDR { public IntPtr lpData; public uint dwBufferLength, dwBytesRecorded; public IntPtr dwUser; public uint dwFlags, dwLoops; public IntPtr lpNext, reserved; }
+  [DllImport("winmm.dll")] static extern int waveInOpen(out IntPtr h, int dev, ref WAVEFORMATEX f, IntPtr cb, IntPtr inst, int flags);
+  [DllImport("winmm.dll")] static extern int waveInPrepareHeader(IntPtr h, IntPtr hdr, int size);
+  [DllImport("winmm.dll")] static extern int waveInUnprepareHeader(IntPtr h, IntPtr hdr, int size);
+  [DllImport("winmm.dll")] static extern int waveInAddBuffer(IntPtr h, IntPtr hdr, int size);
+  [DllImport("winmm.dll")] static extern int waveInStart(IntPtr h);
+  [DllImport("winmm.dll")] static extern int waveInReset(IntPtr h);
+  [DllImport("winmm.dll")] static extern int waveInClose(IntPtr h);
+  public static int Run(int device) {
+    var fmt = new WAVEFORMATEX { wFormatTag = 1, nChannels = 1, nSamplesPerSec = 16000, nAvgBytesPerSec = 32000, nBlockAlign = 2, wBitsPerSample = 16 };
+    var ev = new AutoResetEvent(false);
+    IntPtr h;
+    int r = waveInOpen(out h, device, ref fmt, ev.SafeWaitHandle.DangerousGetHandle(), IntPtr.Zero, 0x50000);
+    if (r != 0) { Console.Error.WriteLine("ERR waveInOpen " + r); return 1; }
+    const int N = 4, BYTES = 3200;
+    int hs = Marshal.SizeOf(typeof(WAVEHDR));
+    var hdrs = new IntPtr[N];
+    for (int i = 0; i < N; i++) {
+      var hd = new WAVEHDR { lpData = Marshal.AllocHGlobal(BYTES), dwBufferLength = BYTES };
+      hdrs[i] = Marshal.AllocHGlobal(hs);
+      Marshal.StructureToPtr(hd, hdrs[i], false);
+      waveInPrepareHeader(h, hdrs[i], hs);
+      waveInAddBuffer(h, hdrs[i], hs);
+    }
+    bool stop = false;
+    var reader = new Thread(() => { Console.In.ReadLine(); stop = true; ev.Set(); });
+    reader.IsBackground = true; reader.Start();
+    var stdout = Console.OpenStandardOutput();
+    waveInStart(h);
+    Console.Error.WriteLine("READY");
+    int next = 0;
+    while (true) {
+      ev.WaitOne(200);
+      if (stop) waveInReset(h);
+      while (true) {
+        var hd = (WAVEHDR)Marshal.PtrToStructure(hdrs[next], typeof(WAVEHDR));
+        if ((hd.dwFlags & 1) == 0) break;
+        if (hd.dwBytesRecorded > 0) {
+          var buf = new byte[hd.dwBytesRecorded];
+          Marshal.Copy(hd.lpData, buf, 0, buf.Length);
+          stdout.Write(buf, 0, buf.Length);
+          stdout.Flush();
+        }
+        if (stop) { hd.dwFlags &= ~1u; hd.dwBytesRecorded = 0; Marshal.StructureToPtr(hd, hdrs[next], false); }
+        else waveInAddBuffer(h, hdrs[next], hs);
+        next = (next + 1) % N;
+      }
+      if (stop) break;
+    }
+    for (int i = 0; i < N; i++) waveInUnprepareHeader(h, hdrs[i], hs);
+    waveInClose(h);
+    return 0;
+  }
+}`;
+
+// O C# compilado fica em cache no temp; compilar a cada gravação custaria ~1 s.
+const CAPTURE_PS = (dll: string) => `
+$ErrorActionPreference = 'Stop'
+$dll = '${dll}'
+if (Test-Path $dll) { Add-Type -Path $dll } else { Add-Type -TypeDefinition $env:PI_MIC_CS -OutputAssembly $dll; Add-Type -Path $dll }
+$dev = if ($env:PI_MIC_DEVICE) { [int]$env:PI_MIC_DEVICE } else { -1 }
+exit [PiMicCapture]::Run($dev)
+`;
+
+const DEVICES_PS = `Add-Type -Namespace PiMic -Name Winmm -MemberDefinition @'
 [DllImport("winmm.dll")] public static extern int waveInGetNumDevs();
 [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Unicode)] public struct WAVEINCAPS { public short wMid; public short wPid; public int vDriverVersion; [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string szPname; public int dwFormats; public short wChannels; public short wReserved1; }
 [DllImport("winmm.dll", CharSet=CharSet.Unicode)] public static extern int waveInGetDevCaps(System.IntPtr id, ref WAVEINCAPS caps, int size);
 '@
-`;
-
-const WIN_RECORD = `${MCI_TYPES}
-function M([string]$c) {
-  $sb = New-Object System.Text.StringBuilder 256
-  $e = [PiMic.Winmm]::mciSendString($c, $sb, 256, [IntPtr]::Zero)
-  if ($e -ne 0) {
-    $m = New-Object System.Text.StringBuilder 256
-    [void][PiMic.Winmm]::mciGetErrorString($e, $m, 256)
-    [Console]::Out.WriteLine("ERR $e $m"); [Console]::Out.Flush(); exit 1
-  }
-}
-M 'open new type waveaudio alias pimic'
-$set = 'set pimic bitspersample 16 channels 1 samplespersec 16000 bytespersec 32000 alignment 2'
-if ($env:PI_MIC_DEVICE) { $set += " input $env:PI_MIC_DEVICE" }
-M $set
-M 'record pimic'
-[Console]::Out.WriteLine('READY'); [Console]::Out.Flush()
-[void][Console]::In.ReadLine()
-M 'stop pimic'
-M ("save pimic " + $env:PI_MIC_OUT)
-M 'close pimic'
-[Console]::Out.WriteLine('SAVED'); [Console]::Out.Flush()
-`;
-
-const WIN_DEVICES = `${MCI_TYPES}
 $n = [PiMic.Winmm]::waveInGetNumDevs()
 $names = @()
 for ($d = 0; $d -lt $n; $d++) {
@@ -63,22 +104,10 @@ function powershell(script: string, env: NodeJS.ProcessEnv = {}): ChildProcess {
   });
 }
 
-function tempWav(): string {
-  // MCI falha no save com caminho curto (ADMINI~1); usa o caminho longo.
-  const dir = realpathSync.native(tmpdir());
-  return join(dir, `pi-mic-${process.pid}-${Date.now()}.wav`);
-}
-
-function readAndRemove(path: string): Uint8Array {
-  const data = readFileSync(path);
-  rmSync(path, { force: true });
-  return data;
-}
-
 /** Nomes dos dispositivos de entrada, na ordem dos ids do waveIn (só Windows). */
 export async function listInputDevices(): Promise<string[]> {
   if (process.platform !== "win32") return [];
-  const child = powershell(WIN_DEVICES);
+  const child = powershell(DEVICES_PS);
   let out = "";
   child.stdout?.on("data", (d: Buffer) => {
     out += d.toString();
@@ -91,84 +120,119 @@ export async function listInputDevices(): Promise<string[]> {
   return Array.isArray(parsed) ? parsed : [parsed];
 }
 
-function startWindows(deviceIndex: number | undefined): Promise<Recording> {
-  const out = tempWav();
-  const child = powershell(WIN_RECORD, {
-    PI_MIC_OUT: `"${out}"`,
+/** Converte bytes PCM s16le em Int16Array, guardando o byte ímpar para o próximo pedaço. */
+function pcmReader(onChunk: (pcm: Int16Array) => void) {
+  let rest: Buffer = Buffer.alloc(0);
+  return (data: Buffer) => {
+    const buf = rest.length ? Buffer.concat([rest, data]) : data;
+    const even = buf.length - (buf.length % 2);
+    rest = buf.subarray(even);
+    if (even === 0) return;
+    const copy = new Uint8Array(buf.subarray(0, even));
+    onChunk(new Int16Array(copy.buffer));
+  };
+}
+
+function startWindows(deviceIndex: number | undefined, onChunk: (pcm: Int16Array) => void) {
+  const hash = createHash("sha1").update(WAVEIN_CS).digest("hex").slice(0, 10);
+  const dll = join(realpathSync.native(tmpdir()), `pi-mic-capture-${hash}.dll`);
+  const child = powershell(CAPTURE_PS(dll), {
+    PI_MIC_CS: existsSync(dll) ? "" : WAVEIN_CS,
     PI_MIC_DEVICE: deviceIndex === undefined ? "" : String(deviceIndex),
   });
-  let buf = "";
-  const lines: ((line: string) => void)[] = [];
-  child.stdout?.on("data", (d: Buffer) => {
-    buf += d.toString();
-    let i = buf.indexOf("\n");
-    while (i >= 0) {
-      const line = buf.slice(0, i).trim();
-      buf = buf.slice(i + 1);
-      for (const l of lines) l(line);
-      i = buf.indexOf("\n");
-    }
-  });
-  const exited = new Promise<number>((resolve) => child.on("exit", (code) => resolve(code ?? 1)));
-  const waitFor = (word: string) =>
-    new Promise<void>((resolve, reject) => {
-      lines.push((line) => {
-        if (line === word) resolve();
-        else if (line.startsWith("ERR")) reject(new Error(`MCI ${line.slice(4)}`));
-      });
-      exited.then((code) => reject(new Error(`recorder exited (${code}) before ${word}`)));
-      child.on("error", reject);
+  child.stdout?.on("data", pcmReader(onChunk));
+  const exited = new Promise<void>((resolve) => child.on("exit", () => resolve()));
+  return new Promise<Capture>((resolve, reject) => {
+    let err = "";
+    child.stderr?.on("data", (d: Buffer) => {
+      err += d.toString();
+      if (err.includes("READY"))
+        resolve({
+          async stop() {
+            child.stdin?.write("\n");
+            await exited;
+          },
+          cancel() {
+            child.kill();
+          },
+        });
     });
-
-  return waitFor("READY").then(() => ({
-    async stop() {
-      const saved = waitFor("SAVED");
-      child.stdin?.write("\n");
-      await saved;
-      return readAndRemove(out);
-    },
-    cancel() {
-      child.kill();
-      rmSync(out, { force: true });
-    },
-  }));
+    child.on("error", reject);
+    exited.then(() => reject(new Error(err.trim().split("\n").pop() || "recorder exited")));
+  });
 }
 
 function which(cmd: string): boolean {
   return spawnSync(cmd, ["--version"], { stdio: "ignore" }).error === undefined;
 }
 
-function startUnix(): Promise<Recording> {
-  const out = tempWav();
+function startUnix(onChunk: (pcm: Int16Array) => void) {
   let child: ChildProcess;
-  if (which("rec")) child = spawn("rec", ["-q", "-c", "1", "-r", "16000", "-b", "16", out]);
+  if (which("rec"))
+    child = spawn("rec", [
+      "-q",
+      "-t",
+      "raw",
+      "-r",
+      "16000",
+      "-b",
+      "16",
+      "-c",
+      "1",
+      "-e",
+      "signed-integer",
+      "-",
+    ]);
   else if (process.platform === "linux" && which("arecord"))
-    child = spawn("arecord", ["-q", "-f", "S16_LE", "-r", "16000", "-c", "1", out]);
+    child = spawn("arecord", ["-q", "-t", "raw", "-f", "S16_LE", "-r", "16000", "-c", "1"]);
   else
     return Promise.reject(
       new Error("no recorder found: install SoX (`rec`) or, on Linux, alsa-utils (`arecord`)"),
     );
+  child.stdout?.on("data", pcmReader(onChunk));
   const exited = new Promise<void>((resolve) => child.on("exit", () => resolve()));
-  return new Promise((resolve, reject) => {
+  return new Promise<Capture>((resolve, reject) => {
     child.on("error", reject);
-    // Os gravadores não sinalizam início; considera iniciado no spawn.
     child.on("spawn", () =>
       resolve({
         async stop() {
           child.kill("SIGINT");
           await exited;
-          return readAndRemove(out);
         },
         cancel() {
           child.kill();
-          rmSync(out, { force: true });
         },
       }),
     );
   });
 }
 
-/** Começa a gravar no dispositivo indicado (índice do waveIn no Windows; ignorado fora dele). */
-export function startRecording(deviceIndex?: number): Promise<Recording> {
-  return process.platform === "win32" ? startWindows(deviceIndex) : startUnix();
+/** Lê um WAV 16 kHz mono no ritmo real, como se fosse o microfone (PI_MIC_FAKE_INPUT, para testes). */
+function startFake(path: string, onChunk: (pcm: Int16Array) => void): Promise<Capture> {
+  const data = readFileSync(path).subarray(44);
+  const read = pcmReader(onChunk);
+  let off = 0;
+  const timer = setInterval(() => {
+    if (off >= data.length) off = 0;
+    read(data.subarray(off, off + 3200));
+    off += 3200;
+  }, 100);
+  return Promise.resolve({
+    async stop() {
+      clearInterval(timer);
+    },
+    cancel() {
+      clearInterval(timer);
+    },
+  });
+}
+
+/** Começa a capturar (índice do waveIn no Windows; ignorado fora dele). */
+export function startCapture(
+  deviceIndex: number | undefined,
+  onChunk: (pcm: Int16Array) => void,
+): Promise<Capture> {
+  const fake = process.env.PI_MIC_FAKE_INPUT;
+  if (fake) return startFake(fake, onChunk);
+  return process.platform === "win32" ? startWindows(deviceIndex, onChunk) : startUnix(onChunk);
 }
