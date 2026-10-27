@@ -1,7 +1,5 @@
 name: release-pr
 
-# Automated git-flow: on every push to dev, compute the next version from the conventional
-# commits since the last tag and keep the release/<version> → main PR open. Nobody picks it.
 on:
   push:
     branches: [dev]
@@ -29,7 +27,7 @@ jobs:
       - id: version
         run: echo "next=$(node scripts/next-version.mjs)" >> "$GITHUB_OUTPUT"
       - if: steps.version.outputs.next == ''
-        run: echo "No feat/fix/perf/breaking change since the last tag; no release."
+        run: echo "No releasable change since the last tag; no release."
       - if: steps.version.outputs.next != ''
         env:
           GH_TOKEN: ${{ github.token }}
@@ -38,8 +36,7 @@ jobs:
           branch="release/$NEXT"
           last=$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)
           range=${last:+$last..}HEAD
-          notes=$(git log --no-merges --format='- %s' $range | grep -E '^- (feat|fix|perf)(\(|!|:)' || true)
-          # Older release PRs left behind are superseded.
+          notes=$(git log --no-merges --format='- %s' $range | grep -E '^- (feat|fix|perf|refactor)(\(|!|:)' || true)
           gh pr list --base main --state open --json number,headRefName \
             -q ".[] | select(.headRefName | startswith(\"release/\")) | select(.headRefName != \"$branch\") | .number" |
             while read -r n; do gh pr close "$n" --delete-branch --comment "Superseded by $branch."; done
