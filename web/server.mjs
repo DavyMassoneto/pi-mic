@@ -109,7 +109,7 @@ function upstreamHeaders(headers) {
   return out;
 }
 
-const TAG = Buffer.from(`<script src="${PREFIX}/client.js" defer></script>`);
+const TAG = Buffer.from(`<script type="module" src="${PREFIX}/client.js"></script>`);
 const HEAD_END = Buffer.from("</head>");
 
 /** Repassa o HTML injetando o script antes de </head>, sem esperar o fim do streaming. */
@@ -157,12 +157,15 @@ function proxy(req, res) {
   res.on("close", () => up.destroy());
 }
 
-const clientJs = readFileSync(join(here, "client.js"));
+const STATIC = Object.fromEntries(
+  ["client.js", "live-core.js"].map((f) => [`${PREFIX}/${f}`, readFileSync(join(here, f))]),
+);
 
 const server = http.createServer((req, res) => {
-  if (req.url === `${PREFIX}/client.js`) {
+  const file = STATIC[req.url];
+  if (file) {
     res.writeHead(200, { "content-type": "text/javascript", "cache-control": "no-cache" });
-    return res.end(clientJs);
+    return res.end(file);
   }
   if (req.url === `${PREFIX}/transcribe` && req.method === "POST")
     return handleTranscribe(req, res);
