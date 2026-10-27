@@ -35,3 +35,15 @@ jobs:
           git tag "$NEXT"
           git push origin "$NEXT"
           gh release create "$NEXT" --generate-notes --title "$NEXT"
+      # Fecha o ciclo do git-flow: main volta para dev e a branch de release é apagada.
+      - env:
+          NEXT: ${{ steps.version.outputs.next }}
+        run: |
+          git reset --hard -q
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git fetch -q origin dev
+          git checkout -q -B dev origin/dev
+          git merge --no-ff origin/main -m "Merge branch 'main' into dev"
+          git push origin dev
+          if [ -n "$NEXT" ]; then git push origin --delete "release/$NEXT" || true; fi

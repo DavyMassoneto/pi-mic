@@ -15,6 +15,10 @@ export interface MicConfig {
   device?: string;
   /** Tempo real pelo streaming do Deepgram. Sem isto, transcreve trecho a trecho via `provider`. */
   realtime?: RealtimeConfig;
+  /** Termos que o Deepgram deve priorizar (nomes de projeto, jargão); vão como `keyterm`. */
+  keyterms?: string[];
+  /** Guarda áudio e eventos de cada sessão do pi-web em <agentDir>/pi-mic-debug. */
+  debug?: boolean;
 }
 
 export interface RealtimeConfig {

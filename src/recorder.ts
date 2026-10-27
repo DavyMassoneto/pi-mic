@@ -4,11 +4,15 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-/** Captura em andamento: entrega PCM 16 kHz mono int16 em pedaços até stop()/cancel(). */
+/** Captura em andamento: entrega PCM mono int16 na taxa nativa (`rate`) até stop()/cancel(). */
 export interface Capture {
+  rate: number;
   stop(): Promise<void>;
   cancel(): void;
 }
+
+/** Taxa pedida ao gravador fora do Windows (lá o waveIn escolhe e informa a sua). */
+const NATIVE_RATE = 48000;
 
 // waveIn (winmm): presente em todo Windows, sem dependência externa. O PCM sai cru no stdout;
 // "READY"/"ERR" vão no stderr. Uma linha no stdin encerra.
@@ -25,16 +29,22 @@ public static class PiMicCapture {
   [DllImport("winmm.dll")] static extern int waveInReset(IntPtr h);
   [DllImport("winmm.dll")] static extern int waveInClose(IntPtr h);
   public static int Run(int device) {
-    var fmt = new WAVEFORMATEX { wFormatTag = 1, nChannels = 1, nSamplesPerSec = 16000, nAvgBytesPerSec = 32000, nBlockAlign = 2, wBitsPerSample = 16 };
     var ev = new AutoResetEvent(false);
-    IntPtr h;
-    int r = waveInOpen(out h, device, ref fmt, ev.SafeWaitHandle.DangerousGetHandle(), IntPtr.Zero, 0x50000);
+    IntPtr h = IntPtr.Zero;
+    int r = -1; uint rate = 0;
+    // Taxa nativa primeiro; só desce se o dispositivo recusar.
+    foreach (uint candidate in new uint[] { 48000, 44100, 16000 }) {
+      var fmt = new WAVEFORMATEX { wFormatTag = 1, nChannels = 1, nSamplesPerSec = candidate, nAvgBytesPerSec = candidate * 2, nBlockAlign = 2, wBitsPerSample = 16 };
+      r = waveInOpen(out h, device, ref fmt, ev.SafeWaitHandle.DangerousGetHandle(), IntPtr.Zero, 0x50000);
+      if (r == 0) { rate = candidate; break; }
+    }
     if (r != 0) { Console.Error.WriteLine("ERR waveInOpen " + r); return 1; }
-    const int N = 4, BYTES = 3200;
+    Console.Error.WriteLine("RATE " + rate);
+    int N = 4, BYTES = (int)(rate / 10) * 2;
     int hs = Marshal.SizeOf(typeof(WAVEHDR));
     var hdrs = new IntPtr[N];
     for (int i = 0; i < N; i++) {
-      var hd = new WAVEHDR { lpData = Marshal.AllocHGlobal(BYTES), dwBufferLength = BYTES };
+      var hd = new WAVEHDR { lpData = Marshal.AllocHGlobal(BYTES), dwBufferLength = (uint)BYTES };
       hdrs[i] = Marshal.AllocHGlobal(hs);
       Marshal.StructureToPtr(hd, hdrs[i], false);
       waveInPrepareHeader(h, hdrs[i], hs);
@@ -148,6 +158,7 @@ function startWindows(deviceIndex: number | undefined, onChunk: (pcm: Int16Array
       err += d.toString();
       if (err.includes("READY"))
         resolve({
+          rate: Number(err.match(/RATE (\d+)/)?.[1] ?? 16000),
           async stop() {
             child.stdin?.write("\n");
             await exited;
@@ -174,7 +185,7 @@ function startUnix(onChunk: (pcm: Int16Array) => void) {
       "-t",
       "raw",
       "-r",
-      "16000",
+      String(NATIVE_RATE),
       "-b",
       "16",
       "-c",
@@ -184,7 +195,17 @@ function startUnix(onChunk: (pcm: Int16Array) => void) {
       "-",
     ]);
   else if (process.platform === "linux" && which("arecord"))
-    child = spawn("arecord", ["-q", "-t", "raw", "-f", "S16_LE", "-r", "16000", "-c", "1"]);
+    child = spawn("arecord", [
+      "-q",
+      "-t",
+      "raw",
+      "-f",
+      "S16_LE",
+      "-r",
+      String(NATIVE_RATE),
+      "-c",
+      "1",
+    ]);
   else
     return Promise.reject(
       new Error("no recorder found: install SoX (`rec`) or, on Linux, alsa-utils (`arecord`)"),
@@ -195,6 +216,7 @@ function startUnix(onChunk: (pcm: Int16Array) => void) {
     child.on("error", reject);
     child.on("spawn", () =>
       resolve({
+        rate: NATIVE_RATE,
         async stop() {
           child.kill("SIGINT");
           await exited;
@@ -207,17 +229,21 @@ function startUnix(onChunk: (pcm: Int16Array) => void) {
   });
 }
 
-/** Lê um WAV 16 kHz mono no ritmo real, como se fosse o microfone (PI_MIC_FAKE_INPUT, para testes). */
+/** Lê um WAV PCM mono no ritmo real, como se fosse o microfone (PI_MIC_FAKE_INPUT, para testes). */
 function startFake(path: string, onChunk: (pcm: Int16Array) => void): Promise<Capture> {
-  const data = readFileSync(path).subarray(44);
+  const file = readFileSync(path);
+  const rate = file.readUInt32LE(24);
+  const data = file.subarray(44);
+  const step = (rate / 10) * 2;
   const read = pcmReader(onChunk);
   let off = 0;
   const timer = setInterval(() => {
     if (off >= data.length) off = 0;
-    read(data.subarray(off, off + 3200));
-    off += 3200;
+    read(data.subarray(off, off + step));
+    off += step;
   }, 100);
   return Promise.resolve({
+    rate,
     async stop() {
       clearInterval(timer);
     },

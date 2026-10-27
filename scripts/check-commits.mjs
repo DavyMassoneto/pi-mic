@@ -1,10 +1,9 @@
 // Falha se algum commit do intervalo (fora merges) não seguir Conventional Commits.
 // Uso: node scripts/check-commits.mjs <base> <head>
 import { execFileSync } from "node:child_process";
+import { CONVENTIONAL as RE } from "./conventional.mjs";
 
 const [base, head = "HEAD"] = process.argv.slice(2);
-const TYPES = "feat|fix|perf|refactor|docs|test|build|ci|chore|style|revert";
-const RE = new RegExp(`^(${TYPES})(\\([\\w./-]+\\))?!?: \\S`);
 
 const valid = (ref) => {
   try {

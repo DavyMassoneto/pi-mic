@@ -1,10 +1,11 @@
 // pi-mic: entrada por voz no pi-web (injetado pelo pi-mic-web, sem alterar o pi-web).
 // O botão entra na mesma linha do Enviar; durante a gravação o campo fica travado e o texto
 // aparece ao vivo, trecho a trecho, conforme a fala.
-import { LiveTranscriber, toPcm16k } from "./live-core.js";
+import { floatToInt16, LiveTranscriber } from "./live-core.js";
 
 if (!window.__piMic) {
   const SELECTOR = "textarea.chat-input-textarea";
+  const TAIL_MS = 500;
   const pt = (navigator.language || "").toLowerCase().startsWith("pt");
   const T = pt
     ? {
@@ -226,9 +227,9 @@ if (!window.__piMic) {
   });`;
 
   /** Tempo real: o pi-mic-web repassa ao streaming do Deepgram (a chave fica no servidor). */
-  function realtimeEngine({ onUpdate, onError }) {
+  function realtimeEngine({ onUpdate, onError }, rate) {
     const ws = new WebSocket(
-      `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/__pi-mic/stream`,
+      `${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/__pi-mic/stream?rate=${rate}`,
     );
     ws.binaryType = "arraybuffer";
     let last = "";
@@ -280,6 +281,7 @@ if (!window.__piMic) {
     } catch (err) {
       return flash(`${T.blocked}: ${err.message}`);
     }
+    // Taxa nativa do microfone: o áudio segue sem reamostrar até o reconhecimento.
     const ctx = new AudioContext();
     const source = ctx.createMediaStreamSource(stream);
     const url = URL.createObjectURL(new Blob([WORKLET], { type: "text/javascript" }));
@@ -309,8 +311,13 @@ if (!window.__piMic) {
     try {
       const cfg = await (await fetch("/__pi-mic/config")).json();
       live = cfg.realtime
-        ? await realtimeEngine(events)
-        : new LiveTranscriber({ interimEveryMs: 600, transcribe: transcribeWav, ...events });
+        ? await realtimeEngine(events, ctx.sampleRate)
+        : new LiveTranscriber({
+            interimEveryMs: 600,
+            sampleRate: ctx.sampleRate,
+            transcribe: transcribeWav,
+            ...events,
+          });
     } catch (err) {
       for (const t of stream.getTracks()) t.stop();
       ctx.close();
@@ -319,10 +326,8 @@ if (!window.__piMic) {
 
     let buf = [];
     let len = 0;
-    node.port.onmessage = (e) => {
-      buf.push(e.data);
-      len += e.data.length;
-      if (len < 2048) return;
+    const drain = () => {
+      if (!len) return;
       const all = new Float32Array(len);
       let o = 0;
       for (const b of buf) {
@@ -331,7 +336,7 @@ if (!window.__piMic) {
       }
       buf = [];
       len = 0;
-      const pcm = toPcm16k(all, ctx.sampleRate);
+      const pcm = floatToInt16(all);
       live.push(pcm);
       if (state === "rec") {
         let sum = 0;
@@ -340,9 +345,15 @@ if (!window.__piMic) {
         btn.style.boxShadow = `0 0 0 ${2 + Math.round(level * 8)}px rgba(217,48,37,.35)`;
       }
     };
+    node.port.onmessage = (e) => {
+      buf.push(e.data);
+      len += e.data.length;
+      if (len >= 1600) drain();
+    };
     source.connect(node);
 
     const release = () => {
+      drain();
       node.port.onmessage = null;
       source.disconnect();
       for (const t of stream.getTracks()) t.stop();
@@ -358,6 +369,8 @@ if (!window.__piMic) {
     const s = session;
     state = "busy";
     render();
+    // A última sílaba costuma sair junto com o clique: grava mais um pouco antes de fechar.
+    await new Promise((r) => setTimeout(r, TAIL_MS));
     s.release();
     const text = await s.live.stop();
     finish(s, text);

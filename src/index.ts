@@ -8,6 +8,8 @@ import { appendText, silentWav, transcribe } from "./transcribe.ts";
 
 const STATUS = "pi-mic";
 const SHORTCUT = "alt+m";
+/** Gravação extra depois de parar, para não cortar a última sílaba. */
+const TAIL_MS = 500;
 
 /** Transcrição em andamento: tempo real (Deepgram) ou trecho a trecho (qualquer provider). */
 interface Engine {
@@ -25,6 +27,7 @@ interface EngineEvents {
 async function createEngine(
   ctx: ExtensionContext,
   config: MicConfig,
+  sampleRate: number,
   ev: EngineEvents,
 ): Promise<Engine> {
   if (config.realtime) {
@@ -32,14 +35,16 @@ async function createEngine(
     if (!apiKey) throw new Error("realtime needs a Deepgram key; run /mic setup");
     const rt = openRealtime({
       apiKey,
+      sampleRate,
       url: config.realtime.url,
       model: config.realtime.model,
       language: config.language,
+      keyterms: config.keyterms,
       onUpdate: ev.onUpdate,
       onError: ev.onError,
     });
     await rt.ready();
-    const gate = new NoiseGate((pcm) => rt.send(pcm), ev.onLevel);
+    const gate = new NoiseGate((pcm) => rt.send(pcm), ev.onLevel, sampleRate);
     return {
       push: (pcm) => gate.push(pcm),
       async stop() {
@@ -52,6 +57,7 @@ async function createEngine(
   const endpoint = await resolveEndpoint(ctx, config);
   return new LiveTranscriber({
     interimEveryMs: 600,
+    sampleRate,
     transcribe: (wav) =>
       transcribe({
         ...endpoint,
@@ -130,27 +136,35 @@ export default function (pi: ExtensionAPI) {
       const config = loadConfig();
       const base = ctx.ui.getEditorText();
       let lastMeter = 0;
-      const live = await createEngine(ctx, config, {
-        onUpdate: (committed, pending) => {
-          if (state.kind !== "recording" && state.kind !== "transcribing") return;
-          ctx.ui.setEditorText(appendText(base, [committed, pending].filter(Boolean).join(" ")));
-        },
-        onLevel: (level) => {
-          const now = Date.now();
-          if (state.kind === "recording" && now - lastMeter > 100) {
-            lastMeter = now;
-            status(ctx, level);
-          }
-        },
-        onError: (err) => ctx.ui.notify(`pi-mic: ${err.message}`, "error"),
-      });
-      let capture: Capture;
+      // A captura vem primeiro: a taxa nativa do microfone define a do reconhecimento. O que
+      // chega antes do motor ficar pronto é guardado e repassado, nada se perde.
+      const early: Int16Array[] = [];
+      let sink = (pcm: Int16Array) => {
+        early.push(pcm);
+      };
+      const capture = await startCapture(await deviceIndex(config), (pcm) => sink(pcm));
+      let live: Engine;
       try {
-        capture = await startCapture(await deviceIndex(config), (pcm) => live.push(pcm));
+        live = await createEngine(ctx, config, capture.rate, {
+          onUpdate: (committed, pending) => {
+            if (state.kind !== "recording" && state.kind !== "transcribing") return;
+            ctx.ui.setEditorText(appendText(base, [committed, pending].filter(Boolean).join(" ")));
+          },
+          onLevel: (level) => {
+            const now = Date.now();
+            if (state.kind === "recording" && now - lastMeter > 100) {
+              lastMeter = now;
+              status(ctx, level);
+            }
+          },
+          onError: (err) => ctx.ui.notify(`pi-mic: ${err.message}`, "error"),
+        });
       } catch (err) {
-        live.cancel();
+        capture.cancel();
         throw err;
       }
+      for (const pcm of early.splice(0)) live.push(pcm);
+      sink = (pcm) => live.push(pcm);
       // Editor travado: só Alt+M (parar) e Esc (cancelar) passam.
       const unlock = ctx.ui.onTerminalInput((data) => {
         if (matchesKey(data, SHORTCUT)) void toggle(ctx);
@@ -167,6 +181,8 @@ export default function (pi: ExtensionAPI) {
   async function stop(ctx: ExtensionContext, rec: Live): Promise<void> {
     setState(ctx, { kind: "transcribing", rec });
     try {
+      // A última sílaba costuma sair junto com a tecla: grava mais um pouco antes de fechar.
+      await new Promise((r) => setTimeout(r, TAIL_MS));
       await rec.capture.stop();
       const text = await rec.live.stop();
       if (!text)
@@ -256,7 +272,7 @@ export default function (pi: ExtensionAPI) {
     const config = loadConfig();
     try {
       if (config.realtime) {
-        const live = await createEngine(ctx, config, {
+        const live = await createEngine(ctx, config, 16000, {
           onUpdate: () => {},
           onLevel: () => {},
           onError: () => {},

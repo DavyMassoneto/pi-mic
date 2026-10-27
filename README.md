@@ -45,7 +45,15 @@ A transcrição aparece no editor enquanto você fala, de dois jeitos:
   manda cada trecho ao `/audio/transcriptions` do provider, com prévia parcial.
 
 Nos dois modos só passa áudio com voz (alto e com tom): teclado, cliques e batidas não viram
-palavras.
+palavras. O áudio segue na taxa nativa do microfone (48 kHz no navegador), sem reamostrar.
+
+No tempo real, ao parar, o pi-mic grava mais 500 ms (a última sílaba costuma sair junto com a
+tecla), manda `Finalize` e espera as finais do streaming, e então reenvia a gravação inteira ao
+Deepgram de áudio gravado, que vê a frase toda; esse texto substitui o do streaming.
+
+Opções extras no `pi-mic.json`: `"keyterms": ["pi-mic", "OmniRoute"]` (termos que o Deepgram
+deve priorizar) e `"debug": true` (o pi-mic-web guarda o áudio e os eventos de cada sessão em
+`~/.pi/agent/pi-mic-debug`).
 Enquanto grava, o editor fica travado (só `Alt+M` para parar e `Esc` para cancelar e voltar ao
 texto de antes) e o rodapé mostra `🔴` com o nível do microfone.
 
@@ -76,11 +84,18 @@ exemplo `tailscale serve --bg 3042`). Não exponha publicamente: o pi-web pode n
 
 ## Desenvolvimento
 
-Fluxo git-flow: `feature/*` → `dev` → `release/*` → `main` (e `hotfix/*` → `main` + `dev`).
-Commits seguem [Conventional Commits](https://www.conventionalcommits.org/); o CI recusa os
-que não seguem. Cada push em `main` calcula a versão pelos commits desde a última tag
-(`feat` → minor, `fix`/`perf` → patch, `!`/`BREAKING CHANGE` → major), publica no npm com
-trusted publishing e cria a tag e a release no GitHub.
+Fluxo git-flow com PRs, tudo em [Conventional Commits](https://www.conventionalcommits.org/)
+(commits e títulos de PR; o CI recusa o que não segue, e também PR com branch fora do fluxo):
+
+1. `feature/<nome>` (ou `bugfix/<nome>`) → PR para `dev`, título como `feat: …` / `fix: …`.
+2. A cada push em `dev`, a esteira calcula a próxima versão pelos commits desde a última tag
+   (`feat` → minor, `fix`/`perf` → patch, `!`/`BREAKING CHANGE` → major; antes da 1.0 a quebra
+   sobe a minor) e abre ou atualiza sozinha a PR `release/<versão>` → `main`, título
+   `chore(release): <versão>`. Ninguém escolhe a versão.
+3. O merge em `main` publica no npm com trusted publishing, cria a tag e a release no GitHub,
+   faz o merge de `main` de volta em `dev` e apaga a branch de release.
+
+`hotfix/<nome>` sai de `main` e volta para `main`.
 
 ```bash
 npm install

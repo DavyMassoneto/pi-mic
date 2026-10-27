@@ -5,11 +5,23 @@ on:
     branches: [dev, "feature/**", "release/**", "hotfix/**"]
   pull_request:
     branches: [dev, main]
+    types: [opened, edited, synchronize, reopened]
 
 permissions:
   contents: read
 
 jobs:
+  pr:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - env:
+          TITLE: ${{ github.event.pull_request.title }}
+          HEAD_REF: ${{ github.event.pull_request.head.ref }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: node scripts/check-pr.mjs "$TITLE" "$HEAD_REF" "$BASE_REF"
+
   check:
     runs-on: ubuntu-latest
     steps:
