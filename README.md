@@ -2,7 +2,7 @@
 
 Voice input for pi, in the terminal (CLI) and in
 [pi-web](https://www.npmjs.com/package/@agegr/pi-web). You speak, the audio goes to an
-OpenAI-compatible `/v1/audio/transcriptions` endpoint (for example OmniRoute with Deepgram) and the
+OpenAI-compatible `/v1/audio/transcriptions` endpoint (for example OmniRoute with Gemini or Deepgram) and the
 text lands in the message field without being sent.
 
 ## Installation
@@ -26,6 +26,32 @@ The configuration lives in `~/.pi/agent/pi-mic.json`:
 
 `language` and `device` are optional: without `language` the gateway detects the language; without
 `device` the system default microphone is used.
+
+## Gemini dictation through OmniRoute
+
+Run `/mic setup`, select provider `omniroute`, select model `agy/gemini-3.8-flash-low`, then
+choose **Per phrase (the provider above)**. The provider must already be registered in pi's
+`models.json`; its base URL (including `/v1`) and API key are resolved from the provider registry
+and `auth.json`. The transcription model does not need to be a chat model in the registry.
+The saved configuration is:
+
+```json
+{ "provider": "omniroute", "model": "agy/gemini-3.8-flash-low", "language": "pt" }
+```
+
+**This model requires the Gemini transcription change from OmniRoute PR branch
+`feat/audio-transcription-gemini` on [DavyMassoneto/OmniRoute](https://github.com/DavyMassoneto/OmniRoute)
+to be deployed on your OmniRoute server.** pi-mic sends multipart audio with
+`model=agy/gemini-3.8-flash-low` to `POST /v1/audio/transcriptions`; a server without that change
+does not support this Gemini transcription path.
+
+Gemini is an option, not the global default: setup does not default to provider `omniroute`, so
+`deepgram/nova-3` remains the default transcription model and existing configured models are kept.
+For `omniroute`, setup offers Gemini alongside the current model and **Other model…** for a custom
+model. Other providers keep the free-text model input. To switch an existing realtime config to
+Gemini dictation, choose **Per phrase** in setup (or remove `realtime` from `pi-mic.json`).
+Deepgram realtime remains a separate option and continues to use its own model (default `nova-3`),
+not the segmented transcription model.
 
 ## CLI
 

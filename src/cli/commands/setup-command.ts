@@ -5,6 +5,19 @@ const REALTIME_MODE = "Real time (Deepgram streaming)";
 const PER_PHRASE_MODE = "Per phrase (the provider above)";
 const KEY_PLACEHOLDER = "••••";
 const DEFAULT_REALTIME_MODEL = "nova-3";
+const OMNIROUTE_GEMINI_MODEL = "agy/gemini-3.8-flash-low";
+const CUSTOM_MODEL = "Other model…";
+
+async function askModel(
+  ctx: ExtensionContext,
+  provider: string,
+  current: string,
+): Promise<string | undefined> {
+  if (provider !== "omniroute") return ctx.ui.input("Transcription model", current);
+  const choices = [...new Set([current, OMNIROUTE_GEMINI_MODEL, CUSTOM_MODEL])];
+  const model = await ctx.ui.select("Transcription model", choices);
+  return model === CUSTOM_MODEL ? ctx.ui.input("Transcription model", current) : model;
+}
 
 async function askRealtime(
   ctx: ExtensionContext,
@@ -28,7 +41,7 @@ export async function setupMic(ctx: ExtensionContext, agentDir: string): Promise
   const config = loadConfig(agentDir);
   const provider = await ctx.ui.select("Provider that serves /audio/transcriptions", providers);
   if (provider === undefined) return;
-  const model = await ctx.ui.input("Transcription model", config.model);
+  const model = await askModel(ctx, provider, config.model);
   const language = await ctx.ui.input("Language (empty = auto)", config.language ?? "");
   const mode = await ctx.ui.select("Mode", [REALTIME_MODE, PER_PHRASE_MODE]);
   let realtime = config.realtime;
